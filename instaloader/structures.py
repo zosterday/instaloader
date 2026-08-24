@@ -1007,6 +1007,40 @@ class Profile:
             data = context.get_json(
                 "api/v1/users/web_profile_info/", params={"username": username.lower()}
             ).get("data")
+        except QueryReturnedBadRequestException as web_profile_info_error:
+            # Instagram's web_profile_info endpoint can fail for business profiles
+            # when one of its internal schema assets has been retired. Resolve the
+            # numeric user ID from the current profile-posts query, then fetch the
+            # complete profile through the current profile-content query.
+            variables = {
+                "data": {
+                    "count": 1,
+                    "include_relationship_info": True,
+                    "latest_besties_reel_media": True,
+                    "latest_reel_media": True,
+                },
+                "username": username.lower(),
+                "__relay_internal__pv__PolarisMultiCaptionCarouselEnabledrelayprovider": False,
+                "__relay_internal__pv__PolarisShortDramaEnabledrelayprovider": False,
+                "__relay_internal__pv__PolarisReelsRecoDebugOverlayEnabledrelayprovider": False,
+            }
+            try:
+                posts_data = context.doc_id_graphql_query(
+                    "27774912572190533",
+                    variables,
+                    referer="https://www.instagram.com/{0}/".format(username.lower()),
+                )
+                edges = (posts_data.get("data") or {})[
+                    "xdt_api__v1__feed__user_timeline_graphql_connection"
+                ]["edges"]
+                user = edges[0]["node"]["user"]
+                if user.get("username", "").lower() != username.lower():
+                    raise KeyError("Profile-posts query returned a different user")
+                profile = cls(context, user)
+                profile._obtain_metadata_graphql()
+                return profile
+            except (InstaloaderException, KeyError, IndexError, TypeError) as fallback_error:
+                raise web_profile_info_error from fallback_error
         except QueryReturnedNotFoundException:
             data = None
         if data and data.get("user"):
@@ -1015,6 +1049,29 @@ class Profile:
             return profile
 
         raise ProfileNotExistsException("Profile {} does not exist.".format(username))
+
+    def _obtain_metadata_graphql(self):
+        """Fetch and normalize profile metadata through PolarisProfilePageContentQuery."""
+        user_id = self._node.get('id') or self._node.get('pk')
+        variables = {
+            "id": str(user_id),
+            "render_surface": "PROFILE",
+            "__relay_internal__pv__PolarisCannesGuardianExperienceEnabledrelayprovider": True,
+            "__relay_internal__pv__PolarisCASB976ProfileEnabledrelayprovider": False,
+            "__relay_internal__pv__PolarisRepostsConsumptionEnabledrelayprovider": False,
+            "__relay_internal__pv__PolarisWebSchoolsEnabledrelayprovider": False,
+            "__relay_internal__pv__PolarisShortDramaEnabledrelayprovider": False,
+            "__relay_internal__pv__PolarisLongformEnabledrelayprovider": False,
+            "enable_integrity_filters": True,
+        }
+        data = self._context.doc_id_graphql_query('38611279431804694', variables)
+        if data is None:
+            raise QueryReturnedNotFoundException('GraphQL query returned None')
+        user_data = (data.get('data') or {}).get('user')
+        if user_data is None:
+            raise ProfileNotExistsException('Profile {} does not exist.'.format(self.username))
+        self._node = self._normalize_profile_data(user_data)
+        self._has_full_metadata = True
 
     @classmethod
     def from_id(cls, context: InstaloaderContext, profile_id: int):
@@ -1100,24 +1157,7 @@ class Profile:
                     self._node = user_data
                     self._has_full_metadata = True
                     return
-                user_id = self._node.get('id') or self._node.get('pk')
-                variables = {
-                    "id": str(user_id),
-                    "render_surface": "PROFILE",
-                    "__relay_internal__pv__PolarisCannesGuardianExperienceEnabledrelayprovider": True,
-                    "__relay_internal__pv__PolarisCASB976ProfileEnabledrelayprovider": False,
-                    "__relay_internal__pv__PolarisRepostsConsumptionEnabledrelayprovider": False,
-                    "__relay_internal__pv__PolarisWebSchoolsEnabledrelayprovider": False,
-                    "enable_integrity_filters": True,
-                }
-                data = self._context.doc_id_graphql_query('27937681195819736', variables)
-                if data is None:
-                    raise QueryReturnedNotFoundException('GraphQL query returned None')
-                user_data = data.get('data', {}).get('user')
-                if user_data is None:
-                    raise ProfileNotExistsException('Profile {} does not exist.'.format(self.username))
-                self._node = self._normalize_profile_data(user_data)
-                self._has_full_metadata = True
+                self._obtain_metadata_graphql()
         except (QueryReturnedNotFoundException, KeyError) as err:
             top_search_results = TopSearchResults(self._context, self.username)
             similar_profiles = [profile.username for profile in top_search_results.get_profiles()]
@@ -1377,19 +1417,12 @@ class Profile:
 
         :rtype: NodeIterator[Post]"""
         self._obtain_metadata()
-        logged_in = self._context.is_logged_in
         return NodeIterator(
             context=self._context,
             edge_extractor=(
-                (lambda d: d["data"]["xdt_api__v1__feed__user_timeline_graphql_connection"])
-                if logged_in
-                else (lambda d: d["data"]["user"]["edge_owner_to_timeline_media"])
+                lambda d: d["data"]["xdt_api__v1__feed__user_timeline_graphql_connection"]
             ),
-            node_wrapper=(
-                (lambda n: Post.from_iphone_struct(self._context, n))
-                if logged_in
-                else (lambda n: Post(self._context, n, self))
-            ),
+            node_wrapper=lambda n: Post.from_iphone_struct(self._context, n),
             query_variables={
                 "data": {
                     "count": 12,
@@ -1397,13 +1430,16 @@ class Profile:
                     "latest_besties_reel_media": True,
                     "latest_reel_media": True,
                 },
-                **({"username": self.username} if logged_in else {"id": self.userid}),
+                "username": self.username,
+                "__relay_internal__pv__PolarisMultiCaptionCarouselEnabledrelayprovider": False,
+                "__relay_internal__pv__PolarisShortDramaEnabledrelayprovider": False,
+                "__relay_internal__pv__PolarisReelsRecoDebugOverlayEnabledrelayprovider": False,
             },
             query_referer="https://www.instagram.com/{0}/".format(self.username),
             is_first=Profile._make_is_newest_checker(),
-            doc_id="7898261790222653" if logged_in else "7950326061742207",
+            doc_id="27774912572190533",
             query_hash=None,
-            first_data=(None if logged_in else self._metadata("edge_owner_to_timeline_media")),
+            first_data=None,
         )
 
     def get_saved_posts(self) -> NodeIterator[Post]:
