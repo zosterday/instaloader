@@ -17,6 +17,8 @@ Exceptions
 
 .. autoexception:: QueryReturnedBadRequestException
 
+.. autoexception:: QueryReturnedUnauthorizedException
+
 .. autoexception:: QueryReturnedForbiddenException
 
 .. autoexception:: ProfileNotExistsException

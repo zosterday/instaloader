@@ -9,6 +9,10 @@ class QueryReturnedBadRequestException(InstaloaderException):
     pass
 
 
+class QueryReturnedUnauthorizedException(InstaloaderException):
+    pass
+
+
 class QueryReturnedForbiddenException(InstaloaderException):
     pass
 

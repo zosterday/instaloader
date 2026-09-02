@@ -1007,11 +1007,12 @@ class Profile:
             data = context.get_json(
                 "api/v1/users/web_profile_info/", params={"username": username.lower()}
             ).get("data")
-        except QueryReturnedBadRequestException as web_profile_info_error:
+        except (QueryReturnedBadRequestException,
+                QueryReturnedUnauthorizedException) as web_profile_info_error:
             # Instagram's web_profile_info endpoint can fail for business profiles
-            # when one of its internal schema assets has been retired. Resolve the
-            # numeric user ID from the current profile-posts query, then fetch the
-            # complete profile through the current profile-content query.
+            # or respond with 401 when the endpoint itself has been retired. Resolve
+            # the numeric user ID from the current profile-posts query, then fetch
+            # the complete profile through the current profile-content query.
             variables = {
                 "data": {
                     "count": 1,

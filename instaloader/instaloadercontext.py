@@ -400,6 +400,7 @@ class InstaloaderContext:
             'feedback_required'/'checkpoint_required'/'challenge_required'
         :raises QueryReturnedBadRequestException: When the server responds with a 400 (and not
             'feedback_required'/'checkpoint_required'/'challenge_required').
+        :raises QueryReturnedUnauthorizedException: When the server responds with a 401.
         :raises QueryReturnedNotFoundException: When the server responds with a 404.
         :raises ConnectionException: When query repeatedly failed.
 
@@ -461,6 +462,11 @@ class InstaloaderContext:
                         # requirements to stop producing more requests
                         raise AbortDownloadException(self._response_error(resp))
                 raise QueryReturnedBadRequestException(self._response_error(resp))
+            if resp.status_code == 401:
+                # Retrying an unauthorized request immediately does not repair an
+                # invalid session or a retired endpoint, and can aggravate rate
+                # limiting. Let the caller choose an alternate query or report it.
+                raise QueryReturnedUnauthorizedException(self._response_error(resp))
             if resp.status_code == 404:
                 raise QueryReturnedNotFoundException(self._response_error(resp))
             if resp.status_code == 429:
