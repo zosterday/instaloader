@@ -950,6 +950,52 @@ class Post:
         return 'pinned_for_users' in self._node and bool(self._node['pinned_for_users'])
 
 
+class _FeedPostIterator(Iterator['Post']):
+    """Iterate a user's timeline through the mobile feed endpoint."""
+
+    def __init__(self, context: InstaloaderContext, username: str,
+                 first_page: Optional[Dict[str, Any]] = None):
+        self._context = context
+        self._username = username
+        self._data = first_page if first_page is not None else self._query()
+        self._page_index = 0
+        self._first_item: Optional['Post'] = None
+        self._seen_cursors: set[str] = set()
+
+    def __iter__(self):
+        return self
+
+    def _query(self, max_id: Optional[str] = None) -> Dict[str, Any]:
+        params: Dict[str, Any] = {'count': 12}
+        if max_id is not None:
+            params['max_id'] = max_id
+        return self._context.get_json(
+            'api/v1/feed/user/{0}/username/'.format(self._username), params=params
+        )
+
+    @property
+    def first_item(self) -> Optional['Post']:
+        """The newest post yielded so far."""
+        return self._first_item
+
+    def __next__(self) -> 'Post':
+        items = self._data.get('items', [])
+        while self._page_index >= len(items):
+            next_max_id = self._data.get('next_max_id')
+            if not self._data.get('more_available') or not next_max_id or next_max_id in self._seen_cursors:
+                raise StopIteration()
+            self._seen_cursors.add(next_max_id)
+            self._data = self._query(next_max_id)
+            self._page_index = 0
+            items = self._data.get('items', [])
+        item = items[self._page_index]
+        self._page_index += 1
+        post = Post.from_iphone_struct(self._context, item)
+        if self._first_item is None or post.date_local > self._first_item.date_local:
+            self._first_item = post
+        return post
+
+
 class Profile:
     """
     An Instagram Profile.
@@ -985,6 +1031,7 @@ class Profile:
         self._node = node
         self._has_full_metadata = False
         self._iphone_struct_ = None
+        self._feed_first_page: Optional[Dict[str, Any]] = None
         if 'iphone_struct' in node:
             # if loaded from JSON with load_structure_from_file()
             self._iphone_struct_ = node['iphone_struct']
@@ -999,57 +1046,11 @@ class Profile:
         :param username: Username
         :raises: :class:`ProfileNotExistsException`
         """
-        # Resolve the profile through the web_profile_info endpoint, which works both
-        # anonymously and when logged in and returns the complete profile node
-        # (including the first page of posts). The GraphQL fbsearch query previously
-        # used here started responding with HTTP 400.
-        try:
-            data = context.get_json(
-                "api/v1/users/web_profile_info/", params={"username": username.lower()}
-            ).get("data")
-        except (QueryReturnedBadRequestException,
-                QueryReturnedUnauthorizedException) as web_profile_info_error:
-            # Instagram's web_profile_info endpoint can fail for business profiles
-            # or respond with 401 when the endpoint itself has been retired. Resolve
-            # the numeric user ID from the current profile-posts query, then fetch
-            # the complete profile through the current profile-content query.
-            variables = {
-                "data": {
-                    "count": 1,
-                    "include_relationship_info": True,
-                    "latest_besties_reel_media": True,
-                    "latest_reel_media": True,
-                },
-                "username": username.lower(),
-                "__relay_internal__pv__PolarisMultiCaptionCarouselEnabledrelayprovider": False,
-                "__relay_internal__pv__PolarisShortDramaEnabledrelayprovider": False,
-                "__relay_internal__pv__PolarisReelsRecoDebugOverlayEnabledrelayprovider": False,
-            }
-            try:
-                posts_data = context.doc_id_graphql_query(
-                    "27774912572190533",
-                    variables,
-                    referer="https://www.instagram.com/{0}/".format(username.lower()),
-                )
-                edges = (posts_data.get("data") or {})[
-                    "xdt_api__v1__feed__user_timeline_graphql_connection"
-                ]["edges"]
-                user = edges[0]["node"]["user"]
-                if user.get("username", "").lower() != username.lower():
-                    raise KeyError("Profile-posts query returned a different user")
-                profile = cls(context, user)
-                profile._obtain_metadata_graphql()
-                return profile
-            except (InstaloaderException, KeyError, IndexError, TypeError) as fallback_error:
-                raise web_profile_info_error from fallback_error
-        except QueryReturnedNotFoundException:
-            data = None
-        if data and data.get("user"):
-            profile = cls(context, data["user"])
-            profile._has_full_metadata = True
-            return profile
-
-        raise ProfileNotExistsException("Profile {} does not exist.".format(username))
+        node, feed_first_page = cls._resolve_node(context, username)
+        profile = cls(context, node)
+        profile._feed_first_page = feed_first_page
+        profile._has_full_metadata = feed_first_page is None or not context.is_logged_in
+        return profile
 
     def _obtain_metadata_graphql(self):
         """Fetch and normalize profile metadata through PolarisProfilePageContentQuery."""
@@ -1115,6 +1116,68 @@ class Profile:
             "iphone_struct": media,
         })
 
+    @staticmethod
+    def _feed_node(context: InstaloaderContext,
+                   username: str) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        """Fetch a profile node and first post page through the mobile feed endpoint."""
+        path = "api/v1/feed/user/{0}/username/".format(username.lower())
+        try:
+            feed = context.get_json(path, params={"count": 12})
+        except (QueryReturnedBadRequestException, QueryReturnedUnauthorizedException, ConnectionException):
+            return None
+        user = feed.get("user")
+        if not user or not user.get("pk"):
+            return None
+        node = {
+            "id": user["pk"],
+            "username": user["username"],
+            "is_private": user["is_private"],
+            "full_name": user["full_name"],
+            "profile_pic_url_hd": user["profile_pic_url"],
+            "iphone_struct": user,
+        }
+        if not context.is_logged_in:
+            # The feed omits the total count. None keeps progress output honest and
+            # prevents another request to the endpoint that just returned 401.
+            node["edge_owner_to_timeline_media"] = {"count": None}
+        return Profile._normalize_profile_data(node), feed
+
+    @classmethod
+    def _resolve_node(cls, context: InstaloaderContext,
+                      username: str) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+        """Resolve a username without repeatedly relying on web_profile_info."""
+        # Anonymous web_profile_info requests are now frequently refused with 401.
+        # The feed endpoint resolves the same public profile and gives us a reusable
+        # first page of posts, so use it first for anonymous downloads.
+        if not context.is_logged_in:
+            feed_node = cls._feed_node(context, username)
+            if feed_node is not None:
+                return feed_node
+
+        try:
+            # A refused endpoint should reach the fallback immediately. A subsequent
+            # feed request still uses the configured retry and rate-control policy.
+            data = context.get_json(
+                "api/v1/users/web_profile_info/", params={"username": username.lower()},
+                _attempt=context.max_connection_attempts
+            ).get("data")
+        except QueryReturnedNotFoundException:
+            data = None
+        except (QueryReturnedBadRequestException, QueryReturnedUnauthorizedException, ConnectionException) as err:
+            feed_node = cls._feed_node(context, username)
+            if feed_node is not None:
+                return feed_node
+            if isinstance(err, QueryReturnedBadRequestException):
+                raise ProfileNotExistsException(
+                    "Profile {} could not be retrieved.{}".format(
+                        username, "" if context.is_logged_in else " Login (--login) may be required."
+                    )
+                ) from err
+            raise
+        if data and data.get("user"):
+            return data["user"], None
+        raise ProfileNotExistsException("Profile {} does not exist.".format(username))
+
     @classmethod
     def own_profile(cls, context: InstaloaderContext):
         """Return own profile if logged-in.
@@ -1141,21 +1204,7 @@ class Profile:
         try:
             if not self._has_full_metadata:
                 if not self._context.is_logged_in:
-                    # Anonymous access: the web_profile_info endpoint returns the full
-                    # node in the legacy format and still works, unlike the GraphQL
-                    # profile query.
-                    try:
-                        data = self._context.get_json(
-                            "api/v1/users/web_profile_info/",
-                            params={"username": self.username},
-                        ).get('data')
-                    except QueryReturnedNotFoundException as err:
-                        raise ProfileNotExistsException(
-                            'Profile {} does not exist.'.format(self.username)) from err
-                    user_data = data.get('user') if data else None
-                    if user_data is None:
-                        raise ProfileNotExistsException('Profile {} does not exist.'.format(self.username))
-                    self._node = user_data
+                    self._node, self._feed_first_page = self._resolve_node(self._context, self.username)
                     self._has_full_metadata = True
                     return
                 self._obtain_metadata_graphql()
@@ -1172,7 +1221,8 @@ class Profile:
                                                         ', '.join(similar_profiles[0:5]))) from err
             raise ProfileNotExistsException('Profile {} does not exist.'.format(self.username)) from err
 
-    def _normalize_profile_data(self, user_data: Dict[str, Any]) -> Dict[str, Any]:
+    @staticmethod
+    def _normalize_profile_data(user_data: Dict[str, Any]) -> Dict[str, Any]:
         """Normalize PolarisProfilePageContentQuery response to match legacy format."""
         normalized = user_data.copy()
         if 'id' not in normalized and 'pk' in normalized:
@@ -1413,11 +1463,13 @@ class Profile:
 	   Use :attr:`profile_pic_url`."""
         return self.profile_pic_url
 
-    def get_posts(self) -> NodeIterator[Post]:
+    def get_posts(self) -> Iterator[Post]:
         """Retrieve all posts from a profile.
 
-        :rtype: NodeIterator[Post]"""
+        :rtype: Iterator[Post]"""
         self._obtain_metadata()
+        if not self._context.is_logged_in:
+            return _FeedPostIterator(self._context, self.username, first_page=self._feed_first_page)
         return NodeIterator(
             context=self._context,
             edge_extractor=(

@@ -1,93 +1,123 @@
 """Unit tests for profile resolution fallbacks."""
 
 import unittest
-from unittest.mock import Mock
+from datetime import datetime
+from unittest.mock import Mock, patch
 
 from instaloader.exceptions import (QueryReturnedBadRequestException,
                                     QueryReturnedUnauthorizedException)
 from instaloader.instaloadercontext import InstaloaderContext
-from instaloader.structures import Profile
+from instaloader.structures import Profile, _FeedPostIterator
+
+
+def feed_response(username="business_profile", items=None, more_available=False, next_max_id=None):
+    return {
+        "status": "ok",
+        "user": {
+            "pk": "1234",
+            "username": username,
+            "is_private": False,
+            "full_name": "Business Profile",
+            "profile_pic_url": "https://example.com/profile.jpg",
+        },
+        "items": [] if items is None else items,
+        "more_available": more_available,
+        "next_max_id": next_max_id,
+    }
 
 
 class TestProfileResolution(unittest.TestCase):
 
-    @staticmethod
-    def _working_graphql_responses():
-        return [
-            {
-                "data": {
-                    "xdt_api__v1__feed__user_timeline_graphql_connection": {
-                        "edges": [{
-                            "node": {
-                                "user": {
-                                    "id": "1234",
-                                    "username": "business_profile",
-                                }
-                            }
-                        }]
-                    }
-                }
-            },
-            {
-                "data": {
-                    "user": {
-                        "id": "1234",
-                        "username": "business_profile",
-                        "full_name": "Business Profile",
-                        "is_private": False,
-                        "follower_count": 42,
-                        "following_count": 7,
-                        "media_count": 3,
-                    }
-                }
-            },
+    def test_anonymous_resolution_uses_feed_without_web_profile_info(self):
+        context = Mock(is_logged_in=False, max_connection_attempts=3)
+        context.get_json.return_value = feed_response()
+
+        profile = Profile.from_username(context, "Business_Profile")
+
+        self.assertEqual(profile.userid, 1234)
+        self.assertEqual(profile.username, "business_profile")
+        self.assertFalse(profile.has_blocked_viewer)
+        self.assertIsNone(profile.mediacount)
+        context.get_json.assert_called_once_with(
+            "api/v1/feed/user/business_profile/username/", params={"count": 12}
+        )
+
+    def test_logged_in_resolution_falls_back_to_feed_after_401(self):
+        context = Mock(is_logged_in=True, max_connection_attempts=3)
+        context.get_json.side_effect = [
+            QueryReturnedUnauthorizedException("web profile info failed"),
+            feed_response(),
         ]
 
-    def test_falls_back_to_current_graphql_queries_after_web_profile_info_400(self):
-        context = Mock()
-        context.get_json.side_effect = QueryReturnedBadRequestException("web profile info failed")
-        context.doc_id_graphql_query.side_effect = self._working_graphql_responses()
-
         profile = Profile.from_username(context, "Business_Profile")
 
         self.assertEqual(profile.userid, 1234)
         self.assertEqual(profile.username, "business_profile")
-        self.assertEqual(profile.followers, 42)
-        self.assertEqual(profile.mediacount, 3)
+        self.assertFalse(profile.has_blocked_viewer)
+        self.assertEqual(context.get_json.call_count, 2)
         self.assertEqual(
-            [call.args[0] for call in context.doc_id_graphql_query.call_args_list],
-            ["27774912572190533", "38611279431804694"],
+            context.get_json.call_args_list[0].args[0],
+            "api/v1/users/web_profile_info/",
+        )
+        self.assertEqual(
+            context.get_json.call_args_list[1].args[0],
+            "api/v1/feed/user/business_profile/username/",
         )
 
-    def test_falls_back_to_current_graphql_queries_after_web_profile_info_401(self):
-        context = Mock()
-        context.get_json.side_effect = QueryReturnedUnauthorizedException("web profile info failed")
-        context.doc_id_graphql_query.side_effect = self._working_graphql_responses()
+    def test_reraises_401_when_feed_fallback_also_fails(self):
+        context = Mock(is_logged_in=True, max_connection_attempts=3)
+        context.get_json.side_effect = [
+            QueryReturnedUnauthorizedException("original failure"),
+            QueryReturnedBadRequestException("feed failure"),
+        ]
 
+        with self.assertRaisesRegex(QueryReturnedUnauthorizedException, "original failure"):
+            Profile.from_username(context, "empty_profile")
+
+    def test_get_posts_reuses_feed_first_page(self):
+        context = Mock(is_logged_in=False, max_connection_attempts=3)
+        context.get_json.return_value = feed_response(items=[{"pk": "post-1"}])
         profile = Profile.from_username(context, "Business_Profile")
+        post = Mock(date_local=datetime(2026, 1, 1))
 
-        self.assertEqual(profile.userid, 1234)
-        self.assertEqual(profile.username, "business_profile")
-        self.assertEqual(profile.followers, 42)
-        self.assertEqual(profile.mediacount, 3)
-        self.assertEqual(
-            [call.args[0] for call in context.doc_id_graphql_query.call_args_list],
-            ["27774912572190533", "38611279431804694"],
-        )
+        with patch("instaloader.structures.Post.from_iphone_struct", return_value=post) as from_struct:
+            posts = profile.get_posts()
+            self.assertIs(next(posts), post)
+            with self.assertRaises(StopIteration):
+                next(posts)
 
-    def test_reraises_web_profile_info_error_when_fallback_cannot_resolve_user(self):
+        self.assertEqual(context.get_json.call_count, 1)
+        from_struct.assert_called_once_with(context, {"pk": "post-1"})
+
+
+class TestFeedPostIterator(unittest.TestCase):
+
+    def test_paginates_with_max_id_and_tracks_newest_post(self):
         context = Mock()
-        context.get_json.side_effect = QueryReturnedBadRequestException("original failure")
-        context.doc_id_graphql_query.return_value = {
-            "data": {
-                "xdt_api__v1__feed__user_timeline_graphql_connection": {
-                    "edges": []
-                }
-            }
+        context.get_json.return_value = {
+            "items": [{"pk": "post-2"}],
+            "more_available": False,
+        }
+        first_page = feed_response(
+            items=[{"pk": "post-1"}], more_available=True, next_max_id="cursor-1"
+        )
+        posts_by_id = {
+            "post-1": Mock(date_local=datetime(2026, 1, 1)),
+            "post-2": Mock(date_local=datetime(2026, 1, 2)),
         }
 
-        with self.assertRaisesRegex(QueryReturnedBadRequestException, "original failure"):
-            Profile.from_username(context, "empty_profile")
+        with patch(
+            "instaloader.structures.Post.from_iphone_struct",
+            side_effect=lambda _context, item: posts_by_id[item["pk"]],
+        ):
+            iterator = _FeedPostIterator(context, "business_profile", first_page=first_page)
+            self.assertEqual(list(iterator), [posts_by_id["post-1"], posts_by_id["post-2"]])
+
+        context.get_json.assert_called_once_with(
+            "api/v1/feed/user/business_profile/username/",
+            params={"count": 12, "max_id": "cursor-1"},
+        )
+        self.assertIs(iterator.first_item, posts_by_id["post-2"])
 
 
 class TestUnauthorizedResponse(unittest.TestCase):
