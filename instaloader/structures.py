@@ -953,10 +953,10 @@ class Post:
 class _FeedPostIterator(Iterator['Post']):
     """Iterate a user's timeline through the mobile feed endpoint."""
 
-    def __init__(self, context: InstaloaderContext, username: str,
+    def __init__(self, context: InstaloaderContext, user_id: Union[int, str],
                  first_page: Optional[Dict[str, Any]] = None):
         self._context = context
-        self._username = username
+        self._user_id = user_id
         self._data = first_page if first_page is not None else self._query()
         self._page_index = 0
         self._first_item: Optional['Post'] = None
@@ -969,8 +969,8 @@ class _FeedPostIterator(Iterator['Post']):
         params: Dict[str, Any] = {'count': 12}
         if max_id is not None:
             params['max_id'] = max_id
-        return self._context.get_json(
-            'api/v1/feed/user/{0}/username/'.format(self._username), params=params
+        return self._context.get_iphone_json(
+            'api/v1/feed/user/{0}/'.format(self._user_id), params=params
         )
 
     @property
@@ -1122,7 +1122,8 @@ class Profile:
         """Fetch a profile node and first post page through the mobile feed endpoint."""
         path = "api/v1/feed/user/{0}/username/".format(username.lower())
         try:
-            feed = context.get_json(path, params={"count": 12})
+            query_feed = context.get_json if context.is_logged_in else context.get_iphone_json
+            feed = query_feed(path, params={"count": 12})
         except (QueryReturnedBadRequestException, QueryReturnedUnauthorizedException, ConnectionException):
             return None
         user = feed.get("user")
@@ -1469,7 +1470,7 @@ class Profile:
         :rtype: Iterator[Post]"""
         self._obtain_metadata()
         if not self._context.is_logged_in:
-            return _FeedPostIterator(self._context, self.username, first_page=self._feed_first_page)
+            return _FeedPostIterator(self._context, self.userid, first_page=self._feed_first_page)
         return NodeIterator(
             context=self._context,
             edge_extractor=(

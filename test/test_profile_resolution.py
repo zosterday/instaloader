@@ -30,7 +30,7 @@ class TestProfileResolution(unittest.TestCase):
 
     def test_anonymous_resolution_uses_feed_without_web_profile_info(self):
         context = Mock(is_logged_in=False, max_connection_attempts=3)
-        context.get_json.return_value = feed_response()
+        context.get_iphone_json.return_value = feed_response()
 
         profile = Profile.from_username(context, "Business_Profile")
 
@@ -38,9 +38,10 @@ class TestProfileResolution(unittest.TestCase):
         self.assertEqual(profile.username, "business_profile")
         self.assertFalse(profile.has_blocked_viewer)
         self.assertIsNone(profile.mediacount)
-        context.get_json.assert_called_once_with(
+        context.get_iphone_json.assert_called_once_with(
             "api/v1/feed/user/business_profile/username/", params={"count": 12}
         )
+        context.get_json.assert_not_called()
 
     def test_logged_in_resolution_falls_back_to_feed_after_401(self):
         context = Mock(is_logged_in=True, max_connection_attempts=3)
@@ -63,6 +64,7 @@ class TestProfileResolution(unittest.TestCase):
             context.get_json.call_args_list[1].args[0],
             "api/v1/feed/user/business_profile/username/",
         )
+        context.get_iphone_json.assert_not_called()
 
     def test_reraises_401_when_feed_fallback_also_fails(self):
         context = Mock(is_logged_in=True, max_connection_attempts=3)
@@ -76,7 +78,7 @@ class TestProfileResolution(unittest.TestCase):
 
     def test_get_posts_reuses_feed_first_page(self):
         context = Mock(is_logged_in=False, max_connection_attempts=3)
-        context.get_json.return_value = feed_response(items=[{"pk": "post-1"}])
+        context.get_iphone_json.return_value = feed_response(items=[{"pk": "post-1"}])
         profile = Profile.from_username(context, "Business_Profile")
         post = Mock(date_local=datetime(2026, 1, 1))
 
@@ -86,7 +88,8 @@ class TestProfileResolution(unittest.TestCase):
             with self.assertRaises(StopIteration):
                 next(posts)
 
-        self.assertEqual(context.get_json.call_count, 1)
+        context.get_json.assert_not_called()
+        self.assertEqual(context.get_iphone_json.call_count, 1)
         from_struct.assert_called_once_with(context, {"pk": "post-1"})
 
 
@@ -94,7 +97,7 @@ class TestFeedPostIterator(unittest.TestCase):
 
     def test_paginates_with_max_id_and_tracks_newest_post(self):
         context = Mock()
-        context.get_json.return_value = {
+        context.get_iphone_json.return_value = {
             "items": [{"pk": "post-2"}],
             "more_available": False,
         }
@@ -110,11 +113,11 @@ class TestFeedPostIterator(unittest.TestCase):
             "instaloader.structures.Post.from_iphone_struct",
             side_effect=lambda _context, item: posts_by_id[item["pk"]],
         ):
-            iterator = _FeedPostIterator(context, "business_profile", first_page=first_page)
+            iterator = _FeedPostIterator(context, 1234, first_page=first_page)
             self.assertEqual(list(iterator), [posts_by_id["post-1"], posts_by_id["post-2"]])
 
-        context.get_json.assert_called_once_with(
-            "api/v1/feed/user/business_profile/username/",
+        context.get_iphone_json.assert_called_once_with(
+            "api/v1/feed/user/1234/",
             params={"count": 12, "max_id": "cursor-1"},
         )
         self.assertIs(iterator.first_item, posts_by_id["post-2"])
