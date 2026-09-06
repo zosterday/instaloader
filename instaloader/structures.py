@@ -1,3 +1,4 @@
+import hashlib
 import json
 import lzma
 import re
@@ -950,6 +951,38 @@ class Post:
         return 'pinned_for_users' in self._node and bool(self._node['pinned_for_users'])
 
 
+class FrozenFeedIterator(NamedTuple):
+    """Serializable state of an anonymous mobile-feed iterator."""
+    user_id: str
+    context_username: Optional[str]
+    total_index: int
+    best_before: float
+    data: Dict[str, Any]
+    page_index: int
+    seen_cursors: List[str]
+    first_node: Optional[Dict[str, Any]]
+
+
+class FrozenAnonymousIterator(NamedTuple):
+    """Serializable state of the web-first anonymous post iterator."""
+    user_id: str
+    context_username: Optional[str]
+    total_index: int
+    best_before: float
+    mode: str
+    primary: Optional[Dict[str, Any]]
+    fallback: Optional[Dict[str, Any]]
+    seen_mediaids: List[int]
+    first_node: Optional[Dict[str, Any]]
+
+
+def _anonymous_iterator_magic(context: InstaloaderContext, user_id: Union[int, str]) -> str:
+    """Return one resume identity regardless of the currently available endpoint."""
+    magic_hash = hashlib.blake2b(digest_size=6)
+    magic_hash.update(json.dumps(['anonymous-profile-posts', str(user_id), context.username]).encode())
+    return b64encode(magic_hash.digest(), b'-_').decode()
+
+
 class _FeedPostIterator(Iterator['Post']):
     """Iterate a user's timeline through the mobile feed endpoint."""
 
@@ -959,8 +992,10 @@ class _FeedPostIterator(Iterator['Post']):
         self._user_id = user_id
         self._data = first_page if first_page is not None else self._query()
         self._page_index = 0
+        self._total_index = 0
         self._first_item: Optional['Post'] = None
         self._seen_cursors: set[str] = set()
+        self._best_before = datetime.now().timestamp() + 29 * 24 * 60 * 60
 
     def __iter__(self):
         return self
@@ -969,9 +1004,21 @@ class _FeedPostIterator(Iterator['Post']):
         params: Dict[str, Any] = {'count': 12}
         if max_id is not None:
             params['max_id'] = max_id
-        return self._context.get_iphone_json(
+        data = self._context.get_iphone_json(
             'api/v1/feed/user/{0}/'.format(self._user_id), params=params
         )
+        self._best_before = datetime.now().timestamp() + 29 * 24 * 60 * 60
+        return data
+
+    @property
+    def magic(self) -> str:
+        """Stable resume-file identifier shared by both anonymous post iterators."""
+        return _anonymous_iterator_magic(self._context, self._user_id)
+
+    @property
+    def total_index(self) -> int:
+        """Number of posts already yielded."""
+        return self._total_index
 
     @property
     def first_item(self) -> Optional['Post']:
@@ -984,16 +1031,48 @@ class _FeedPostIterator(Iterator['Post']):
             next_max_id = self._data.get('next_max_id')
             if not self._data.get('more_available') or not next_max_id or next_max_id in self._seen_cursors:
                 raise StopIteration()
+            next_data = self._query(next_max_id)
             self._seen_cursors.add(next_max_id)
-            self._data = self._query(next_max_id)
+            self._data = next_data
             self._page_index = 0
             items = self._data.get('items', [])
         item = items[self._page_index]
         self._page_index += 1
+        self._total_index += 1
         post = Post.from_iphone_struct(self._context, item)
         if self._first_item is None or post.date_local > self._first_item.date_local:
             self._first_item = post
         return post
+
+    def freeze(self) -> 'FrozenFeedIterator':
+        """Return a checkpoint that retries the last yielded post when resumed."""
+        return FrozenFeedIterator(
+            user_id=str(self._user_id),
+            context_username=self._context.username,
+            total_index=max(self._total_index - 1, 0),
+            best_before=self._best_before,
+            data=self._data,
+            page_index=max(self._page_index - 1, 0),
+            seen_cursors=sorted(self._seen_cursors),
+            first_node=self._first_item._node if self._first_item is not None else None,
+        )
+
+    def thaw(self, frozen: Any) -> None:
+        """Restore a mobile-feed checkpoint."""
+        if isinstance(frozen, FrozenAnonymousIterator) and frozen.mode == 'fallback' and frozen.fallback is not None:
+            nested = FrozenFeedIterator(**frozen.fallback)
+            frozen = nested._replace(total_index=frozen.total_index)
+        if not isinstance(frozen, FrozenFeedIterator):
+            raise InvalidArgumentException("Mismatching resume information.")
+        if str(self._user_id) != frozen.user_id or self._context.username != frozen.context_username:
+            raise InvalidArgumentException("Mismatching resume information.")
+        self._total_index = frozen.total_index
+        self._best_before = frozen.best_before
+        self._data = frozen.data
+        self._page_index = frozen.page_index
+        self._seen_cursors = set(frozen.seen_cursors)
+        if frozen.first_node is not None:
+            self._first_item = Post(self._context, frozen.first_node)
 
 
 class _AnonymousPostIterator(Iterator['Post']):
@@ -1006,6 +1085,9 @@ class _AnonymousPostIterator(Iterator['Post']):
         self._fallback: Optional[_FeedPostIterator] = None
         self._seen_mediaids: set[int] = set()
         self._first_item: Optional['Post'] = None
+        self._last_mediaid: Optional[int] = None
+        self._total_index = 0
+        self._best_before = datetime.now().timestamp() + 29 * 24 * 60 * 60
 
     def __iter__(self):
         return self
@@ -1014,6 +1096,16 @@ class _AnonymousPostIterator(Iterator['Post']):
     def first_item(self) -> Optional['Post']:
         """The newest post yielded so far."""
         return self._first_item
+
+    @property
+    def magic(self) -> str:
+        """Stable resume-file identifier shared by both anonymous post iterators."""
+        return _anonymous_iterator_magic(self._context, self._user_id)
+
+    @property
+    def total_index(self) -> int:
+        """Number of posts already yielded."""
+        return self._total_index
 
     def __next__(self) -> 'Post':
         while True:
@@ -1033,9 +1125,65 @@ class _AnonymousPostIterator(Iterator['Post']):
             if post.mediaid in self._seen_mediaids:
                 continue
             self._seen_mediaids.add(post.mediaid)
+            self._last_mediaid = post.mediaid
+            self._total_index += 1
             if self._first_item is None or post.date_local > self._first_item.date_local:
                 self._first_item = post
             return post
+
+    def freeze(self) -> 'FrozenAnonymousIterator':
+        """Return a checkpoint for either the web or mobile phase."""
+        seen_mediaids = self._seen_mediaids.copy()
+        if self._last_mediaid is not None:
+            seen_mediaids.discard(self._last_mediaid)
+        mode = 'fallback' if self._fallback is not None else 'primary'
+        primary = (self._primary.freeze()._asdict()
+                   if mode == 'primary' and isinstance(self._primary, NodeIterator) else None)
+        fallback = self._fallback.freeze()._asdict() if self._fallback is not None else None
+        return FrozenAnonymousIterator(
+            user_id=str(self._user_id),
+            context_username=self._context.username,
+            total_index=max(self._total_index - 1, 0),
+            best_before=self._best_before,
+            mode=mode,
+            primary=primary,
+            fallback=fallback,
+            seen_mediaids=sorted(seen_mediaids),
+            first_node=self._first_item._node if self._first_item is not None else None,
+        )
+
+    def thaw(self, frozen: Any) -> None:
+        """Restore a web or mobile anonymous-post checkpoint."""
+        if isinstance(frozen, FrozenFeedIterator):
+            if str(self._user_id) != frozen.user_id or self._context.username != frozen.context_username:
+                raise InvalidArgumentException("Mismatching resume information.")
+            self._fallback = _FeedPostIterator(self._context, self._user_id, first_page={})
+            self._fallback.thaw(frozen)
+            self._total_index = frozen.total_index
+            self._best_before = frozen.best_before
+            if frozen.first_node is not None:
+                self._first_item = Post(self._context, frozen.first_node)
+            return
+        if not isinstance(frozen, FrozenAnonymousIterator):
+            raise InvalidArgumentException("Mismatching resume information.")
+        if str(self._user_id) != frozen.user_id or self._context.username != frozen.context_username:
+            raise InvalidArgumentException("Mismatching resume information.")
+        if frozen.mode == 'primary':
+            if frozen.primary is None or not isinstance(self._primary, NodeIterator):
+                raise InvalidArgumentException("Primary iterator resume information missing.")
+            self._primary.thaw(FrozenNodeIterator(**frozen.primary))
+        elif frozen.mode == 'fallback':
+            if frozen.fallback is None:
+                raise InvalidArgumentException("Fallback iterator resume information missing.")
+            self._fallback = _FeedPostIterator(self._context, self._user_id, first_page={})
+            self._fallback.thaw(FrozenFeedIterator(**frozen.fallback))
+        else:
+            raise InvalidArgumentException("Unknown anonymous iterator mode.")
+        self._total_index = frozen.total_index
+        self._best_before = frozen.best_before
+        self._seen_mediaids = set(frozen.seen_mediaids)
+        if frozen.first_node is not None:
+            self._first_item = Post(self._context, frozen.first_node)
 
 
 class Profile:
@@ -2489,12 +2637,12 @@ class TitlePic:
         return self._date_utc.astimezone() if self._date_utc is not None else None
 
 
-JsonExportable = Union[Post, Profile, StoryItem, Hashtag, FrozenNodeIterator]
+JsonExportable = Union[Post, Profile, StoryItem, Hashtag, FrozenNodeIterator,
+                       FrozenFeedIterator, FrozenAnonymousIterator]
 
 
 def get_json_structure(structure: JsonExportable) -> dict:
-    """Returns Instaloader JSON structure for a :class:`Post`, :class:`Profile`, :class:`StoryItem`, :class:`Hashtag`
-     or :class:`FrozenNodeIterator` so that it can be loaded by :func:`load_structure`.
+    """Returns an Instaloader JSON structure that can be loaded by :func:`load_structure`.
 
     :param structure: :class:`Post`, :class:`Profile`, :class:`StoryItem` or :class:`Hashtag`
 
@@ -2550,6 +2698,10 @@ def load_structure(context: InstaloaderContext, json_structure: dict) -> JsonExp
             if not 'first_node' in json_structure['node']:
                 json_structure['node']['first_node'] = None
             return FrozenNodeIterator(**json_structure['node'])
+        elif node_type == "FrozenFeedIterator":
+            return FrozenFeedIterator(**json_structure['node'])
+        elif node_type == "FrozenAnonymousIterator":
+            return FrozenAnonymousIterator(**json_structure['node'])
     elif 'shortcode' in json_structure:
         # Post JSON created with Instaloader v3
         return Post.from_shortcode(context, json_structure['shortcode'])

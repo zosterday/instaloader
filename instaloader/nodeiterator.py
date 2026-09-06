@@ -258,7 +258,7 @@ class NodeIterator(Iterator[T]):
 def resumable_iteration(context: InstaloaderContext,
                         iterator: Iterable,
                         load: Callable[[InstaloaderContext, str], Any],
-                        save: Callable[[FrozenNodeIterator, str], None],
+                        save: Callable[[Any, str], None],
                         format_path: Callable[[str], str],
                         check_bbd: bool = True,
                         enabled: bool = True) -> Iterator[Tuple[bool, int]]:
@@ -282,13 +282,13 @@ def resumable_iteration(context: InstaloaderContext,
 
     It yields a tuple (is_resuming, start_index).
 
-    When the passed iterator is not a :class:`NodeIterator`, it behaves as if ``resumable_iteration`` was not used,
-    just executing the inner body.
+    Custom iterators can participate by exposing ``magic``, ``total_index``,
+    ``freeze()`` and ``thaw()`` with the same semantics as :class:`NodeIterator`.
 
     :param context: The :class:`InstaloaderContext`.
-    :param iterator: The fresh :class:`NodeIterator`.
-    :param load: Loads a FrozenNodeIterator from given path. The object is ignored if it has a different type.
-    :param save: Saves the given FrozenNodeIterator to the given path.
+    :param iterator: A fresh resumable iterator.
+    :param load: Loads frozen iterator state from the given path.
+    :param save: Saves the frozen iterator state to the given path.
     :param format_path: Returns the path to the resume file for the given magic.
     :param check_bbd: Whether to check the best before date and reject an expired FrozenNodeIterator.
     :param enabled: Set to False to disable all functionality and simply execute the inner body.
@@ -296,32 +296,33 @@ def resumable_iteration(context: InstaloaderContext,
     .. versionchanged:: 4.7
        Also interrupt on :class:`AbortDownloadException`.
     """
-    if not enabled or not isinstance(iterator, NodeIterator):
+    resumable_attributes = ('magic', 'total_index', 'freeze', 'thaw')
+    if not enabled or not all(hasattr(iterator, attribute) for attribute in resumable_attributes):
         yield False, 0
         return
     is_resuming = False
     start_index = 0
-    resume_file_path = format_path(iterator.magic)
+    resume_file_path = format_path(iterator.magic)  # type: ignore[attr-defined]
     resume_file_exists = os.path.isfile(resume_file_path)
     if resume_file_exists:
         try:
             fni = load(context, resume_file_path)
-            if not isinstance(fni, FrozenNodeIterator):
-                raise InvalidArgumentException("Invalid type.")
-            if check_bbd and fni.best_before and datetime.fromtimestamp(fni.best_before) < datetime.now():
+            best_before = getattr(fni, 'best_before', None)
+            if check_bbd and best_before and datetime.fromtimestamp(best_before) < datetime.now():
                 raise InvalidArgumentException("\"Best before\" date exceeded.")
-            iterator.thaw(fni)
+            iterator.thaw(fni)  # type: ignore[attr-defined]
             is_resuming = True
-            start_index = iterator.total_index
+            start_index = iterator.total_index  # type: ignore[attr-defined]
             context.log("Resuming from {}.".format(resume_file_path))
-        except (InvalidArgumentException, LZMAError, json.decoder.JSONDecodeError, EOFError) as exc:
+        except (InvalidArgumentException, LZMAError, json.decoder.JSONDecodeError, EOFError,
+                AttributeError, KeyError, TypeError) as exc:
             context.error("Warning: Not resuming from {}: {}".format(resume_file_path, exc))
     try:
         yield is_resuming, start_index
     except (Exception, KeyboardInterrupt):
         if os.path.dirname(resume_file_path):
             os.makedirs(os.path.dirname(resume_file_path), exist_ok=True)
-        save(iterator.freeze(), resume_file_path)
+        save(iterator.freeze(), resume_file_path)  # type: ignore[attr-defined]
         context.log("\nSaved resume information to {}.".format(resume_file_path))
         raise
     if resume_file_exists:

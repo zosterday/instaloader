@@ -1,13 +1,17 @@
 """Unit tests for profile resolution fallbacks."""
 
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from instaloader.exceptions import (ConnectionException, QueryReturnedBadRequestException,
                                     QueryReturnedUnauthorizedException)
 from instaloader.instaloadercontext import InstaloaderContext
-from instaloader.structures import Profile, _AnonymousPostIterator, _FeedPostIterator
+from instaloader.nodeiterator import NodeIterator, resumable_iteration
+from instaloader.structures import (Profile, _AnonymousPostIterator, _FeedPostIterator,
+                                    load_structure_from_file, save_structure_to_file)
 
 
 def feed_response(username="business_profile", items=None, more_available=False, next_max_id=None):
@@ -181,8 +185,188 @@ class TestFeedPostIterator(unittest.TestCase):
         )
         self.assertIs(iterator.first_item, posts_by_id["post-2"])
 
+    def test_failure_saves_checkpoint_and_next_run_retries_only_last_post(self):
+        context = Mock(username=None)
+        first_page = feed_response(items=[{"pk": "post-1"}, {"pk": "post-2"}])
+        posts_by_id = {
+            "post-1": Mock(
+                date_local=datetime(2026, 1, 2, tzinfo=timezone.utc),
+                _node={"id": "1", "shortcode": "one", "taken_at_timestamp": 1767312000},
+            ),
+            "post-2": Mock(
+                date_local=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                _node={"id": "2", "shortcode": "two", "taken_at_timestamp": 1767225600},
+            ),
+        }
+
+        with TemporaryDirectory() as temp_dir, patch(
+            "instaloader.structures.Post.from_iphone_struct",
+            side_effect=lambda _context, item: posts_by_id[item["pk"]],
+        ):
+            resume_path = str(Path(temp_dir) / "resume.json.xz")
+            iterator = _FeedPostIterator(context, 1234, first_page=first_page)
+            with self.assertRaisesRegex(RuntimeError, "download failed"):
+                with resumable_iteration(
+                    context,
+                    iterator,
+                    load_structure_from_file,
+                    save_structure_to_file,
+                    lambda _magic: resume_path,
+                ):
+                    self.assertIs(next(iterator), posts_by_id["post-1"])
+                    raise RuntimeError("download failed")
+
+            self.assertTrue(Path(resume_path).is_file())
+            resumed_iterator = _FeedPostIterator(context, 1234, first_page=first_page)
+            with resumable_iteration(
+                context,
+                resumed_iterator,
+                load_structure_from_file,
+                save_structure_to_file,
+                lambda _magic: resume_path,
+            ) as (is_resuming, start_index):
+                self.assertTrue(is_resuming)
+                self.assertEqual(start_index, 0)
+                self.assertEqual(
+                    list(resumed_iterator),
+                    [posts_by_id["post-1"], posts_by_id["post-2"]],
+                )
+
+            self.assertFalse(Path(resume_path).exists())
+
+    def test_failed_later_page_resumes_at_failed_cursor_without_replaying_earlier_pages(self):
+        context = Mock(username=None)
+        first_page = feed_response(
+            items=[{"pk": "post-1"}, {"pk": "post-2"}],
+            more_available=True,
+            next_max_id="cursor-1",
+        )
+        second_page = {
+            "items": [{"pk": "post-3"}, {"pk": "post-4"}],
+            "more_available": True,
+            "next_max_id": "cursor-2",
+        }
+        final_page = {"items": [{"pk": "post-5"}], "more_available": False}
+        posts_by_id = {
+            "post-{}".format(number): Mock(
+                date_local=datetime(2026, 1, number, tzinfo=timezone.utc),
+                _node={
+                    "id": str(number),
+                    "shortcode": "post-{}".format(number),
+                    "taken_at_timestamp": 1767225600 + number,
+                },
+            )
+            for number in range(1, 6)
+        }
+        context.get_iphone_json.side_effect = [second_page, ConnectionException("page refused")]
+
+        with TemporaryDirectory() as temp_dir, patch(
+            "instaloader.structures.Post.from_iphone_struct",
+            side_effect=lambda _context, item: posts_by_id[item["pk"]],
+        ):
+            resume_path = str(Path(temp_dir) / "resume.json.xz")
+            iterator = _FeedPostIterator(context, 1234, first_page=first_page)
+            with self.assertRaisesRegex(ConnectionException, "page refused"):
+                with resumable_iteration(
+                    context,
+                    iterator,
+                    load_structure_from_file,
+                    save_structure_to_file,
+                    lambda _magic: resume_path,
+                ):
+                    list(iterator)
+
+            self.assertEqual(context.get_iphone_json.call_count, 2)
+            context.get_iphone_json.reset_mock(side_effect=True)
+            context.get_iphone_json.return_value = final_page
+            resumed_iterator = _FeedPostIterator(context, 1234, first_page=first_page)
+            with resumable_iteration(
+                context,
+                resumed_iterator,
+                load_structure_from_file,
+                save_structure_to_file,
+                lambda _magic: resume_path,
+            ) as (is_resuming, start_index):
+                self.assertTrue(is_resuming)
+                self.assertEqual(start_index, 3)
+                self.assertEqual(
+                    list(resumed_iterator),
+                    [posts_by_id["post-4"], posts_by_id["post-5"]],
+                )
+
+            context.get_iphone_json.assert_called_once_with(
+                "api/v1/feed/user/1234/", params={"count": 12, "max_id": "cursor-2"}
+            )
+
 
 class TestAnonymousPostIterator(unittest.TestCase):
+
+    def test_web_run_checkpoint_resumes_master_iterator(self):
+        context = Mock(username=None)
+        posts = {
+            "1": Mock(
+                mediaid=1,
+                date_local=datetime(2026, 1, 2, tzinfo=timezone.utc),
+                _node={"id": "1", "shortcode": "one", "taken_at_timestamp": 1767312000},
+            ),
+            "2": Mock(
+                mediaid=2,
+                date_local=datetime(2026, 1, 1, tzinfo=timezone.utc),
+                _node={"id": "2", "shortcode": "two", "taken_at_timestamp": 1767225600},
+            ),
+        }
+        first_data = {
+            "count": 2,
+            "edges": [{"node": {"id": "1"}}, {"node": {"id": "2"}}],
+            "page_info": {"has_next_page": False, "end_cursor": None},
+        }
+
+        def new_hybrid():
+            primary = NodeIterator(
+                context,
+                query_hash="web-query",
+                edge_extractor=lambda data: data,
+                node_wrapper=lambda node: posts[node["id"]],
+                query_variables={"id": "1234"},
+                query_referer="https://www.instagram.com/example/",
+                first_data=first_data,
+            )
+            return _AnonymousPostIterator(context, primary, 1234)
+
+        with TemporaryDirectory() as temp_dir:
+            resume_path = str(Path(temp_dir) / "resume.json.xz")
+            hybrid = new_hybrid()
+            with self.assertRaisesRegex(RuntimeError, "download failed"):
+                with resumable_iteration(
+                    context,
+                    hybrid,
+                    load_structure_from_file,
+                    save_structure_to_file,
+                    lambda _magic: resume_path,
+                ):
+                    self.assertIs(next(hybrid), posts["1"])
+                    raise RuntimeError("download failed")
+
+            resumed_hybrid = new_hybrid()
+            with resumable_iteration(
+                context,
+                resumed_hybrid,
+                load_structure_from_file,
+                save_structure_to_file,
+                lambda _magic: resume_path,
+            ) as (is_resuming, start_index):
+                self.assertTrue(is_resuming)
+                self.assertEqual(start_index, 0)
+                self.assertEqual(list(resumed_hybrid), [posts["1"], posts["2"]])
+
+    def test_uses_same_resume_identity_as_mobile_iterator(self):
+        context = Mock(username=None)
+        feed = _FeedPostIterator(context, 1234, first_page=feed_response())
+        hybrid = _AnonymousPostIterator(context, iter(()), 1234)
+
+        self.assertEqual(feed.magic, hybrid.magic)
+        self.assertNotIn('/', feed.magic)
+        self.assertNotIn('+', feed.magic)
 
     def test_keeps_mobile_unused_when_web_iterator_succeeds(self):
         context = Mock()
@@ -224,6 +408,65 @@ class TestAnonymousPostIterator(unittest.TestCase):
         )
         context.log.assert_called_once()
         self.assertIs(iterator.first_item, web_post)
+
+    def test_mobile_run_can_resume_checkpoint_created_after_web_fallback(self):
+        context = Mock(username=None)
+        web_post = Mock(
+            mediaid=1,
+            date_local=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            _node={"id": "1", "shortcode": "one", "taken_at_timestamp": 1767312000},
+        )
+        duplicate = Mock(
+            mediaid=1,
+            date_local=datetime(2026, 1, 2, tzinfo=timezone.utc),
+            _node={"id": "1", "shortcode": "one", "taken_at_timestamp": 1767312000},
+        )
+        fallback_post = Mock(
+            mediaid=2,
+            date_local=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            _node={"id": "2", "shortcode": "two", "taken_at_timestamp": 1767225600},
+        )
+        fallback_page = {
+            "items": [{"pk": "post-1"}, {"pk": "post-2"}],
+            "more_available": False,
+        }
+        context.get_iphone_json.return_value = fallback_page
+
+        def failing_web_iterator():
+            yield web_post
+            raise ConnectionException("web timeline refused")
+
+        posts_by_id = {"post-1": duplicate, "post-2": fallback_post}
+        with TemporaryDirectory() as temp_dir, patch(
+            "instaloader.structures.Post.from_iphone_struct",
+            side_effect=lambda _context, item: posts_by_id[item["pk"]],
+        ):
+            resume_path = str(Path(temp_dir) / "resume.json.xz")
+            hybrid = _AnonymousPostIterator(context, failing_web_iterator(), 1234)
+            with self.assertRaisesRegex(RuntimeError, "download failed"):
+                with resumable_iteration(
+                    context,
+                    hybrid,
+                    load_structure_from_file,
+                    save_structure_to_file,
+                    lambda _magic: resume_path,
+                ):
+                    self.assertIs(next(hybrid), web_post)
+                    self.assertIs(next(hybrid), fallback_post)
+                    raise RuntimeError("download failed")
+
+            # Simulate the next invocation resolving through mobile immediately.
+            mobile = _FeedPostIterator(context, 1234, first_page=fallback_page)
+            with resumable_iteration(
+                context,
+                mobile,
+                load_structure_from_file,
+                save_structure_to_file,
+                lambda _magic: resume_path,
+            ) as (is_resuming, start_index):
+                self.assertTrue(is_resuming)
+                self.assertEqual(start_index, 1)
+                self.assertEqual(list(mobile), [fallback_post])
 
 
 class TestUnauthorizedResponse(unittest.TestCase):
