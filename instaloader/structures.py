@@ -957,7 +957,7 @@ class FrozenFeedIterator(NamedTuple):
     context_username: Optional[str]
     total_index: int
     best_before: float
-    data: Dict[str, Any]
+    data: Optional[Dict[str, Any]]
     page_index: int
     seen_cursors: List[str]
     first_node: Optional[Dict[str, Any]]
@@ -986,11 +986,17 @@ def _anonymous_iterator_magic(context: InstaloaderContext, user_id: Union[int, s
 class _FeedPostIterator(Iterator['Post']):
     """Iterate a user's timeline through the mobile feed endpoint."""
 
+    _page_size = 30
+    _request_interval = (6.0, 12.0)
+
     def __init__(self, context: InstaloaderContext, user_id: Union[int, str],
                  first_page: Optional[Dict[str, Any]] = None):
         self._context = context
         self._user_id = user_id
-        self._data = first_page if first_page is not None else self._query()
+        # Keep the initial request lazy.  resumable_iteration() is entered only
+        # after this object is constructed, and must get a chance to thaw a
+        # saved cursor before any request for the first page is made.
+        self._data = first_page
         self._page_index = 0
         self._total_index = 0
         self._first_item: Optional['Post'] = None
@@ -1001,9 +1007,10 @@ class _FeedPostIterator(Iterator['Post']):
         return self
 
     def _query(self, max_id: Optional[str] = None) -> Dict[str, Any]:
-        params: Dict[str, Any] = {'count': 12}
+        params: Dict[str, Any] = {'count': self._page_size}
         if max_id is not None:
             params['max_id'] = max_id
+        self._context.do_sleep(*self._request_interval)
         data = self._context.get_iphone_json(
             'api/v1/feed/user/{0}/'.format(self._user_id), params=params
         )
@@ -1026,6 +1033,8 @@ class _FeedPostIterator(Iterator['Post']):
         return self._first_item
 
     def __next__(self) -> 'Post':
+        if self._data is None:
+            self._data = self._query()
         items = self._data.get('items', [])
         while self._page_index >= len(items):
             next_max_id = self._data.get('next_max_id')
@@ -1076,16 +1085,13 @@ class _FeedPostIterator(Iterator['Post']):
 
 
 class _AnonymousPostIterator(Iterator['Post']):
-    """Use the web timeline first and switch to the mobile feed only if it fails."""
+    """Keep an anonymously-started web timeline on web pagination."""
 
     def __init__(self, context: InstaloaderContext, primary: Iterator['Post'], user_id: Union[int, str]):
         self._context = context
         self._primary = primary
         self._user_id = user_id
-        self._fallback: Optional[_FeedPostIterator] = None
-        self._seen_mediaids: set[int] = set()
         self._first_item: Optional['Post'] = None
-        self._last_mediaid: Optional[int] = None
         self._total_index = 0
         self._best_before = datetime.now().timestamp() + 29 * 24 * 60 * 60
 
@@ -1108,80 +1114,40 @@ class _AnonymousPostIterator(Iterator['Post']):
         return self._total_index
 
     def __next__(self) -> 'Post':
-        while True:
-            if self._fallback is None:
-                try:
-                    post = next(self._primary)
-                except (InstaloaderException, KeyError, TypeError) as err:
-                    self._context.log(
-                        "Anonymous web pagination failed ({}). Switching to the mobile fallback."
-                        .format(err)
-                    )
-                    self._fallback = _FeedPostIterator(self._context, self._user_id)
-                    continue
-            else:
-                post = next(self._fallback)
-
-            if post.mediaid in self._seen_mediaids:
-                continue
-            self._seen_mediaids.add(post.mediaid)
-            self._last_mediaid = post.mediaid
-            self._total_index += 1
-            if self._first_item is None or post.date_local > self._first_item.date_local:
-                self._first_item = post
-            return post
+        post = next(self._primary)
+        self._total_index += 1
+        if self._first_item is None or post.date_local > self._first_item.date_local:
+            self._first_item = post
+        return post
 
     def freeze(self) -> 'FrozenAnonymousIterator':
-        """Return a checkpoint for either the web or mobile phase."""
-        seen_mediaids = self._seen_mediaids.copy()
-        if self._last_mediaid is not None:
-            seen_mediaids.discard(self._last_mediaid)
-        mode = 'fallback' if self._fallback is not None else 'primary'
-        primary = (self._primary.freeze()._asdict()
-                   if mode == 'primary' and isinstance(self._primary, NodeIterator) else None)
-        fallback = self._fallback.freeze()._asdict() if self._fallback is not None else None
+        """Return a checkpoint for the master-style web iterator."""
+        primary = self._primary.freeze()._asdict() if isinstance(self._primary, NodeIterator) else None
         return FrozenAnonymousIterator(
             user_id=str(self._user_id),
             context_username=self._context.username,
             total_index=max(self._total_index - 1, 0),
             best_before=self._best_before,
-            mode=mode,
+            mode='primary',
             primary=primary,
-            fallback=fallback,
-            seen_mediaids=sorted(seen_mediaids),
+            fallback=None,
+            seen_mediaids=[],
             first_node=self._first_item._node if self._first_item is not None else None,
         )
 
     def thaw(self, frozen: Any) -> None:
-        """Restore a web or mobile anonymous-post checkpoint."""
+        """Restore a web checkpoint, rejecting mobile cursors that cannot be translated."""
         if isinstance(frozen, FrozenFeedIterator):
-            if str(self._user_id) != frozen.user_id or self._context.username != frozen.context_username:
-                raise InvalidArgumentException("Mismatching resume information.")
-            self._fallback = _FeedPostIterator(self._context, self._user_id, first_page={})
-            self._fallback.thaw(frozen)
-            self._total_index = frozen.total_index
-            self._best_before = frozen.best_before
-            if frozen.first_node is not None:
-                self._first_item = Post(self._context, frozen.first_node)
-            return
+            raise InvalidArgumentException("A mobile checkpoint cannot be applied to web pagination.")
         if not isinstance(frozen, FrozenAnonymousIterator):
             raise InvalidArgumentException("Mismatching resume information.")
         if str(self._user_id) != frozen.user_id or self._context.username != frozen.context_username:
             raise InvalidArgumentException("Mismatching resume information.")
-        if frozen.mode == 'primary':
-            if frozen.primary is None or not isinstance(self._primary, NodeIterator):
-                raise InvalidArgumentException("Primary iterator resume information missing.")
-            self._primary.thaw(FrozenNodeIterator(**frozen.primary))
-        elif frozen.mode == 'fallback':
-            if frozen.fallback is None:
-                raise InvalidArgumentException("Fallback iterator resume information missing.")
-            self._fallback = _FeedPostIterator(self._context, self._user_id, first_page={})
-            self._fallback.thaw(FrozenFeedIterator(**frozen.fallback))
-        else:
-            raise InvalidArgumentException("Unknown anonymous iterator mode.")
+        if frozen.mode != 'primary' or frozen.primary is None or not isinstance(self._primary, NodeIterator):
+            raise InvalidArgumentException("A mobile checkpoint cannot be applied to web pagination.")
+        self._primary.thaw(FrozenNodeIterator(**frozen.primary))
         self._total_index = frozen.total_index
         self._best_before = frozen.best_before
-        self._seen_mediaids = set(frozen.seen_mediaids)
         if frozen.first_node is not None:
             self._first_item = Post(self._context, frozen.first_node)
 
@@ -1222,24 +1188,28 @@ class Profile:
         self._has_full_metadata = False
         self._iphone_struct_ = None
         self._feed_first_page: Optional[Dict[str, Any]] = None
+        self._is_id_only = False
         if 'iphone_struct' in node:
             # if loaded from JSON with load_structure_from_file()
             self._iphone_struct_ = node['iphone_struct']
 
     @classmethod
-    def from_username(cls, context: InstaloaderContext, username: str):
+    def from_username(cls, context: InstaloaderContext, username: str,
+                      profile_id: Optional[int] = None):
         """Create a Profile instance from a given username, raise exception if it does not exist.
 
         See also :meth:`Instaloader.check_profile_id`.
 
         :param context: :attr:`Instaloader.context`
         :param username: Username
+        :param profile_id: Optional locally stored ID to try before mobile resolution.
         :raises: :class:`ProfileNotExistsException`
         """
-        node, feed_first_page = cls._resolve_node(context, username)
+        node, feed_first_page, is_id_only = cls._resolve_node(context, username, profile_id)
         profile = cls(context, node)
         profile._feed_first_page = feed_first_page
-        profile._has_full_metadata = feed_first_page is None or not context.is_logged_in
+        profile._is_id_only = is_id_only
+        profile._has_full_metadata = is_id_only or feed_first_page is None or not context.is_logged_in
         return profile
 
     def _obtain_metadata_graphql(self):
@@ -1313,7 +1283,9 @@ class Profile:
         path = "api/v1/feed/user/{0}/username/".format(username.lower())
         try:
             query_feed = context.get_json if context.is_logged_in else context.get_iphone_json
-            feed = query_feed(path, params={"count": 12})
+            feed = query_feed(path, params={"count": _FeedPostIterator._page_size})
+        except TooManyRequestsException:
+            raise
         except (QueryReturnedBadRequestException, QueryReturnedUnauthorizedException, ConnectionException):
             return None
         user = feed.get("user")
@@ -1335,11 +1307,11 @@ class Profile:
 
     @classmethod
     def _resolve_node(cls, context: InstaloaderContext,
-                      username: str) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+                      username: str,
+                      profile_id: Optional[int] = None
+                      ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], bool]:
         """Resolve through the web endpoint, with the mobile feed as a fallback."""
         try:
-            # A refused endpoint should reach the fallback immediately. The mobile
-            # request that follows still uses the configured retry and rate control.
             data = context.get_json(
                 "api/v1/users/web_profile_info/", params={"username": username.lower()},
                 _attempt=context.max_connection_attempts
@@ -1347,9 +1319,13 @@ class Profile:
         except QueryReturnedNotFoundException:
             data = None
         except (QueryReturnedBadRequestException, QueryReturnedUnauthorizedException, ConnectionException) as err:
+            if profile_id is not None and not context.is_logged_in:
+                context.log("Web profile lookup failed; trying stored profile ID {} before mobile."
+                            .format(profile_id), flush=True)
+                return cls._cached_id_node(username, profile_id), None, True
             feed_node = cls._feed_node(context, username)
             if feed_node is not None:
-                return feed_node
+                return feed_node[0], feed_node[1], False
             if isinstance(err, QueryReturnedBadRequestException):
                 raise ProfileNotExistsException(
                     "Profile {} could not be retrieved.{}".format(
@@ -1358,11 +1334,27 @@ class Profile:
                 ) from err
             raise
         if data and data.get("user"):
-            return data["user"], None
+            return data["user"], None, False
+        if profile_id is not None and not context.is_logged_in:
+            context.log("Web profile lookup returned no user; trying stored profile ID {} before mobile."
+                        .format(profile_id), flush=True)
+            return cls._cached_id_node(username, profile_id), None, True
         feed_node = cls._feed_node(context, username)
         if feed_node is not None:
-            return feed_node
+            return feed_node[0], feed_node[1], False
         raise ProfileNotExistsException("Profile {} does not exist.".format(username))
+
+    @staticmethod
+    def _cached_id_node(username: str, profile_id: int) -> Dict[str, Any]:
+        """Build the minimal public profile node needed to try web posts by a stored ID."""
+        return Profile._normalize_profile_data({
+            "id": str(profile_id),
+            "username": username.lower(),
+            "is_private": False,
+            "full_name": username,
+            "profile_pic_url_hd": "",
+            "edge_owner_to_timeline_media": {"count": None},
+        })
 
     @classmethod
     def own_profile(cls, context: InstaloaderContext):
@@ -1390,7 +1382,9 @@ class Profile:
         try:
             if not self._has_full_metadata:
                 if not self._context.is_logged_in:
-                    self._node, self._feed_first_page = self._resolve_node(self._context, self.username)
+                    self._node, self._feed_first_page, self._is_id_only = self._resolve_node(
+                        self._context, self.username
+                    )
                     self._has_full_metadata = True
                     return
                 self._obtain_metadata_graphql()
@@ -1474,6 +1468,11 @@ class Profile:
     def userid(self) -> int:
         """User ID"""
         return int(self._metadata('id'))
+
+    @property
+    def is_id_only(self) -> bool:
+        """Whether only locally cached public identity data is currently available."""
+        return self._is_id_only
 
     @property
     def username(self) -> str:
@@ -1657,25 +1656,35 @@ class Profile:
         if not self._context.is_logged_in and self._feed_first_page is not None:
             return _FeedPostIterator(self._context, self.userid, first_page=self._feed_first_page)
         if not self._context.is_logged_in:
-            primary = NodeIterator(
-                context=self._context,
-                edge_extractor=lambda d: d["data"]["user"]["edge_owner_to_timeline_media"],
-                node_wrapper=lambda n: Post(self._context, n, self),
-                query_variables={
-                    "data": {
-                        "count": 12,
-                        "include_relationship_info": True,
-                        "latest_besties_reel_media": True,
-                        "latest_reel_media": True,
+            try:
+                primary = NodeIterator(
+                    context=self._context,
+                    edge_extractor=lambda d: d["data"]["user"]["edge_owner_to_timeline_media"],
+                    node_wrapper=lambda n: Post(self._context, n, self),
+                    query_variables={
+                        "data": {
+                            "count": 12,
+                            "include_relationship_info": True,
+                            "latest_besties_reel_media": True,
+                            "latest_reel_media": True,
+                        },
+                        "id": self.userid,
                     },
-                    "id": self.userid,
-                },
-                query_referer="https://www.instagram.com/{0}/".format(self.username),
-                is_first=Profile._make_is_newest_checker(),
-                doc_id="7950326061742207",
-                query_hash=None,
-                first_data=self._metadata("edge_owner_to_timeline_media"),
-            )
+                    query_referer="https://www.instagram.com/{0}/".format(self.username),
+                    is_first=Profile._make_is_newest_checker(),
+                    doc_id="7950326061742207",
+                    query_hash=None,
+                    first_data=(None if self._feed_first_page is not None or self._is_id_only
+                                else self._metadata("edge_owner_to_timeline_media")),
+                )
+            except (InstaloaderException, KeyError, TypeError) as err:
+                self._context.log(
+                    "Anonymous web post pagination could not be started ({}). Using the mobile fallback."
+                    .format(err), flush=True
+                )
+                return _FeedPostIterator(
+                    self._context, self.userid, first_page=self._feed_first_page
+                )
             return _AnonymousPostIterator(self._context, primary, self.userid)
         return NodeIterator(
             context=self._context,

@@ -1377,16 +1377,20 @@ class Instaloader:
         .. versionchanged:: 4.8
            Add `latest_stamps` parameter.
         """
-        profile = None
-        profile_name_not_exists_err = None
-        try:
-            profile = Profile.from_username(self.context, profile_name)
-        except ProfileNotExistsException as err:
-            profile_name_not_exists_err = err
         if latest_stamps is None:
             profile_id = self.load_profile_id(profile_name)
         else:
             profile_id = latest_stamps.get_profile_id(profile_name)
+        profile = None
+        profile_name_not_exists_err = None
+        try:
+            profile = Profile.from_username(
+                self.context,
+                profile_name,
+                profile_id=profile_id if not self.context.is_logged_in else None,
+            )
+        except ProfileNotExistsException as err:
+            profile_name_not_exists_err = err
         if profile_id is not None:
             if (profile is None) or \
                     (profile_id != profile.userid):
@@ -1490,8 +1494,12 @@ class Instaloader:
 
                 # Download profile picture
                 if profile_pic:
-                    with self.context.error_catcher('Download profile picture of {}'.format(profile_name)):
-                        self.download_profilepic_if_new(profile, latest_stamps)
+                    if profile.is_id_only:
+                        self.context.log("Using stored profile ID; deferring profile picture lookup until web "
+                                         "profile metadata is available.", flush=True)
+                    else:
+                        with self.context.error_catcher('Download profile picture of {}'.format(profile_name)):
+                            self.download_profilepic_if_new(profile, latest_stamps)
 
                 # Save metadata as JSON if desired.
                 if self.save_metadata:

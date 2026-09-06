@@ -362,10 +362,12 @@ class InstaloaderContext:
         self.username = user
         self.two_factor_auth_pending = None
 
-    def do_sleep(self):
+    def do_sleep(self, minimum: float = 0.0, maximum: float = 15.0):
         """Sleep a short time if self.sleep is set. Called before each request to instagram.com."""
         if self.sleep:
-            time.sleep(min(random.expovariate(0.6), 15.0))
+            delay = (random.uniform(minimum, maximum) if minimum > 0
+                     else min(random.expovariate(0.6), maximum))
+            time.sleep(delay)
 
     @staticmethod
     def _response_error(resp: requests.Response) -> str:
@@ -463,9 +465,15 @@ class InstaloaderContext:
                         raise AbortDownloadException(self._response_error(resp))
                 raise QueryReturnedBadRequestException(self._response_error(resp))
             if resp.status_code == 401:
-                # Retrying an unauthorized request immediately does not repair an
-                # invalid session or a retired endpoint, and can aggravate rate
-                # limiting. Let the caller choose an alternate query or report it.
+                message = None
+                with suppress(json.decoder.JSONDecodeError):
+                    message = resp.json().get('message')
+                if (not self.is_logged_in and is_iphone_query and isinstance(message, str) and
+                        message.lower().startswith('please wait')):
+                    # Instagram sometimes reports anonymous throttling as 401
+                    # instead of 429. Route only that response through the normal
+                    # rate controller so retries happen after a real cooldown.
+                    raise TooManyRequestsException(self._response_error(resp))
                 raise QueryReturnedUnauthorizedException(self._response_error(resp))
             if resp.status_code == 404:
                 raise QueryReturnedNotFoundException(self._response_error(resp))
@@ -483,6 +491,8 @@ class InstaloaderContext:
             if _attempt == self.max_connection_attempts:
                 if isinstance(err, QueryReturnedNotFoundException):
                     raise QueryReturnedNotFoundException(error_string) from err
+                if isinstance(err, TooManyRequestsException):
+                    raise TooManyRequestsException(error_string) from err
                 else:
                     raise ConnectionException(error_string) from err
             self.error(error_string + " [retrying; skip with ^C]", repeat_at_end=False)
@@ -497,7 +507,7 @@ class InstaloaderContext:
                     if is_other_query:
                         self._rate_controller.handle_429('other')
                 return self.get_json(path=path, params=params, host=host, session=sess, _attempt=_attempt + 1,
-                                     response_headers=response_headers)
+                                     response_headers=response_headers, use_post=use_post)
             except KeyboardInterrupt:
                 self.error("[skipped by user]", repeat_at_end=False)
                 raise ConnectionException(error_string) from err

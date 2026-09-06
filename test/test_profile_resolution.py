@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from instaloader.exceptions import (ConnectionException, QueryReturnedBadRequestException,
                                     QueryReturnedUnauthorizedException)
+from instaloader.instaloader import Instaloader
 from instaloader.instaloadercontext import InstaloaderContext
 from instaloader.nodeiterator import NodeIterator, resumable_iteration
 from instaloader.structures import (Profile, _AnonymousPostIterator, _FeedPostIterator,
@@ -82,9 +83,38 @@ class TestProfileResolution(unittest.TestCase):
         self.assertFalse(profile.has_blocked_viewer)
         self.assertIsNone(profile.mediacount)
         context.get_iphone_json.assert_called_once_with(
-            "api/v1/feed/user/business_profile/username/", params={"count": 12}
+            "api/v1/feed/user/business_profile/username/", params={"count": 30}
         )
         context.get_json.assert_called_once()
+
+    def test_cached_id_is_used_before_mobile_profile_resolution(self):
+        context = Mock(is_logged_in=False, max_connection_attempts=3)
+        context.get_json.side_effect = QueryReturnedUnauthorizedException("web profile info failed")
+
+        profile = Profile.from_username(context, "Cached_Profile", profile_id=1234)
+
+        self.assertEqual(profile.userid, 1234)
+        self.assertEqual(profile.username, "cached_profile")
+        self.assertTrue(profile.is_id_only)
+        context.get_iphone_json.assert_not_called()
+
+    def test_cached_id_reaches_mobile_only_after_master_posts_fail(self):
+        context = Mock(is_logged_in=False, max_connection_attempts=3)
+        context.get_json.side_effect = QueryReturnedUnauthorizedException("web profile info failed")
+        context.doc_id_graphql_query.side_effect = QueryReturnedUnauthorizedException("web posts failed")
+        context.get_iphone_json.return_value = feed_response(items=[])
+
+        profile = Profile.from_username(context, "Cached_Profile", profile_id=1234)
+        self.assertEqual(context.get_iphone_json.call_count, 0)
+        posts = profile.get_posts()
+
+        self.assertIsInstance(posts, _FeedPostIterator)
+        context.doc_id_graphql_query.assert_called_once()
+        context.get_iphone_json.assert_not_called()
+        self.assertEqual(list(posts), [])
+        context.get_iphone_json.assert_called_once_with(
+            "api/v1/feed/user/1234/", params={"count": 30}
+        )
 
     def test_get_posts_keeps_mobile_unused_when_bundled_web_page_is_complete(self):
         context = Mock(is_logged_in=False, max_connection_attempts=3)
@@ -153,10 +183,40 @@ class TestProfileResolution(unittest.TestCase):
 
         context.get_json.assert_called_once()
         self.assertEqual(context.get_iphone_json.call_count, 1)
+        context.doc_id_graphql_query.assert_not_called()
         from_struct.assert_called_once_with(context, {"pk": "post-1"})
 
 
+class TestCachedProfileID(unittest.TestCase):
+
+    def test_cli_passes_stored_id_into_anonymous_web_resolution(self):
+        loader = Instaloader(sleep=False)
+        profile = Mock(userid=1234)
+
+        with patch.object(loader, "load_profile_id", return_value=1234), patch(
+            "instaloader.instaloader.Profile.from_username", return_value=profile
+        ) as from_username:
+            result = loader.check_profile_id("cached_profile")
+
+        self.assertIs(result, profile)
+        from_username.assert_called_once_with(
+            loader.context, "cached_profile", profile_id=1234
+        )
+
+
 class TestFeedPostIterator(unittest.TestCase):
+
+    def test_spaces_fallback_page_requests(self):
+        context = Mock(sleep=True)
+        context.get_iphone_json.return_value = {"items": [], "more_available": False}
+        iterator = _FeedPostIterator(context, 1234, first_page=feed_response())
+
+        iterator._query("cursor-1")
+
+        context.do_sleep.assert_called_once_with(6.0, 12.0)
+        context.get_iphone_json.assert_called_once_with(
+            "api/v1/feed/user/1234/", params={"count": 30, "max_id": "cursor-1"}
+        )
 
     def test_paginates_with_max_id_and_tracks_newest_post(self):
         context = Mock()
@@ -181,7 +241,7 @@ class TestFeedPostIterator(unittest.TestCase):
 
         context.get_iphone_json.assert_called_once_with(
             "api/v1/feed/user/1234/",
-            params={"count": 12, "max_id": "cursor-1"},
+            params={"count": 30, "max_id": "cursor-1"},
         )
         self.assertIs(iterator.first_item, posts_by_id["post-2"])
 
@@ -279,7 +339,8 @@ class TestFeedPostIterator(unittest.TestCase):
             self.assertEqual(context.get_iphone_json.call_count, 2)
             context.get_iphone_json.reset_mock(side_effect=True)
             context.get_iphone_json.return_value = final_page
-            resumed_iterator = _FeedPostIterator(context, 1234, first_page=first_page)
+            resumed_iterator = _FeedPostIterator(context, 1234)
+            context.get_iphone_json.assert_not_called()
             with resumable_iteration(
                 context,
                 resumed_iterator,
@@ -295,7 +356,7 @@ class TestFeedPostIterator(unittest.TestCase):
                 )
 
             context.get_iphone_json.assert_called_once_with(
-                "api/v1/feed/user/1234/", params={"count": 12, "max_id": "cursor-2"}
+                "api/v1/feed/user/1234/", params={"count": 30, "max_id": "cursor-2"}
             )
 
 
@@ -381,97 +442,81 @@ class TestAnonymousPostIterator(unittest.TestCase):
         context.get_iphone_json.assert_not_called()
         self.assertIs(iterator.first_item, posts[0])
 
-    def test_switches_after_web_failure_and_skips_duplicate_posts(self):
+    def test_does_not_switch_to_mobile_after_web_pagination_started(self):
         context = Mock()
         web_post = Mock(mediaid=1, date_local=datetime(2026, 1, 2))
-        duplicate = Mock(mediaid=1, date_local=datetime(2026, 1, 2))
-        fallback_post = Mock(mediaid=2, date_local=datetime(2026, 1, 1))
-        context.get_iphone_json.return_value = {
-            "items": [{"pk": "post-1"}, {"pk": "post-2"}],
-            "more_available": False,
-        }
 
         def failing_web_iterator():
             yield web_post
             raise ConnectionException("web timeline refused")
 
-        posts_by_id = {"post-1": duplicate, "post-2": fallback_post}
-        with patch(
-            "instaloader.structures.Post.from_iphone_struct",
-            side_effect=lambda _context, item: posts_by_id[item["pk"]],
-        ):
-            iterator = _AnonymousPostIterator(context, failing_web_iterator(), 1234)
-            self.assertEqual(list(iterator), [web_post, fallback_post])
+        iterator = _AnonymousPostIterator(context, failing_web_iterator(), 1234)
+        self.assertIs(next(iterator), web_post)
+        with self.assertRaisesRegex(ConnectionException, "web timeline refused"):
+            next(iterator)
 
-        context.get_iphone_json.assert_called_once_with(
-            "api/v1/feed/user/1234/", params={"count": 12}
-        )
-        context.log.assert_called_once()
+        context.get_iphone_json.assert_not_called()
         self.assertIs(iterator.first_item, web_post)
 
-    def test_mobile_run_can_resume_checkpoint_created_after_web_fallback(self):
+    def test_web_run_ignores_untranslatable_mobile_checkpoint(self):
         context = Mock(username=None)
         web_post = Mock(
             mediaid=1,
             date_local=datetime(2026, 1, 2, tzinfo=timezone.utc),
             _node={"id": "1", "shortcode": "one", "taken_at_timestamp": 1767312000},
         )
-        duplicate = Mock(
-            mediaid=1,
-            date_local=datetime(2026, 1, 2, tzinfo=timezone.utc),
-            _node={"id": "1", "shortcode": "one", "taken_at_timestamp": 1767312000},
-        )
-        fallback_post = Mock(
-            mediaid=2,
-            date_local=datetime(2026, 1, 1, tzinfo=timezone.utc),
-            _node={"id": "2", "shortcode": "two", "taken_at_timestamp": 1767225600},
-        )
         fallback_page = {
-            "items": [{"pk": "post-1"}, {"pk": "post-2"}],
+            "items": [{"pk": "post-1"}],
             "more_available": False,
         }
-        context.get_iphone_json.return_value = fallback_page
-
-        def failing_web_iterator():
-            yield web_post
-            raise ConnectionException("web timeline refused")
-
-        posts_by_id = {"post-1": duplicate, "post-2": fallback_post}
         with TemporaryDirectory() as temp_dir, patch(
             "instaloader.structures.Post.from_iphone_struct",
-            side_effect=lambda _context, item: posts_by_id[item["pk"]],
+            return_value=web_post,
         ):
             resume_path = str(Path(temp_dir) / "resume.json.xz")
-            hybrid = _AnonymousPostIterator(context, failing_web_iterator(), 1234)
+            mobile = _FeedPostIterator(context, 1234, first_page=fallback_page)
             with self.assertRaisesRegex(RuntimeError, "download failed"):
                 with resumable_iteration(
                     context,
-                    hybrid,
+                    mobile,
                     load_structure_from_file,
                     save_structure_to_file,
                     lambda _magic: resume_path,
                 ):
-                    self.assertIs(next(hybrid), web_post)
-                    self.assertIs(next(hybrid), fallback_post)
+                    self.assertIs(next(mobile), web_post)
                     raise RuntimeError("download failed")
 
-            # Simulate the next invocation resolving through mobile immediately.
-            mobile = _FeedPostIterator(context, 1234, first_page=fallback_page)
+            primary = NodeIterator(
+                context,
+                query_hash="web-query",
+                edge_extractor=lambda data: data,
+                node_wrapper=lambda _node: web_post,
+                query_variables={"id": "1234"},
+                query_referer="https://www.instagram.com/example/",
+                first_data={
+                    "count": 1,
+                    "edges": [{"node": {"id": "1"}}],
+                    "page_info": {"has_next_page": False, "end_cursor": None},
+                },
+            )
+            hybrid = _AnonymousPostIterator(context, primary, 1234)
             with resumable_iteration(
                 context,
-                mobile,
+                hybrid,
                 load_structure_from_file,
                 save_structure_to_file,
                 lambda _magic: resume_path,
             ) as (is_resuming, start_index):
-                self.assertTrue(is_resuming)
-                self.assertEqual(start_index, 1)
-                self.assertEqual(list(mobile), [fallback_post])
+                self.assertFalse(is_resuming)
+                self.assertEqual(start_index, 0)
+                self.assertEqual(list(hybrid), [web_post])
+
+            self.assertFalse(Path(resume_path).exists())
 
 
 class TestUnauthorizedResponse(unittest.TestCase):
 
-    def test_401_is_not_retried(self):
+    def test_non_rate_limit_401_is_not_retried(self):
         response = Mock(
             status_code=401,
             reason="Unauthorized",
@@ -481,7 +526,7 @@ class TestUnauthorizedResponse(unittest.TestCase):
         )
         response.json.return_value = {
             "status": "fail",
-            "message": "Please wait a few minutes before you try again.",
+            "message": "login_required",
         }
         session = Mock()
         session.get.return_value = response
@@ -496,6 +541,64 @@ class TestUnauthorizedResponse(unittest.TestCase):
             )
 
         session.get.assert_called_once()
+
+    def test_anonymous_web_please_wait_401_is_treated_as_endpoint_failure(self):
+        throttled = Mock(
+            status_code=401,
+            reason="Unauthorized",
+            url="https://www.instagram.com/graphql/query",
+            is_redirect=False,
+            headers={},
+        )
+        throttled.json.return_value = {
+            "status": "fail",
+            "message": "Please wait a few minutes before you try again.",
+        }
+        session = Mock()
+        session.post.return_value = throttled
+        context = InstaloaderContext(sleep=False, max_connection_attempts=3)
+        context._rate_controller = Mock()
+
+        with self.assertRaises(QueryReturnedUnauthorizedException):
+            context.get_json(
+                "graphql/query",
+                params={"doc_id": "web-query", "variables": "{}"},
+                session=session,
+                use_post=True,
+            )
+
+        session.post.assert_called_once()
+        context._rate_controller.handle_429.assert_not_called()
+
+    def test_anonymous_mobile_please_wait_401_uses_iphone_cooldown(self):
+        throttled = Mock(
+            status_code=401,
+            reason="Unauthorized",
+            url="https://i.instagram.com/api/v1/feed/user/1234/",
+            is_redirect=False,
+            headers={},
+        )
+        throttled.json.return_value = {
+            "status": "fail",
+            "message": "Please wait a few minutes before you try again.",
+        }
+        successful = Mock(status_code=200, is_redirect=False, headers={})
+        successful.json.return_value = {"status": "ok", "items": []}
+        session = Mock()
+        session.get.side_effect = [throttled, successful]
+        context = InstaloaderContext(sleep=False, max_connection_attempts=3)
+        context._rate_controller = Mock()
+
+        result = context.get_json(
+            "api/v1/feed/user/1234/",
+            params={"count": 12},
+            host="i.instagram.com",
+            session=session,
+        )
+
+        self.assertEqual(result, {"status": "ok", "items": []})
+        self.assertEqual(session.get.call_count, 2)
+        context._rate_controller.handle_429.assert_called_once_with("iphone")
 
 
 if __name__ == '__main__':
