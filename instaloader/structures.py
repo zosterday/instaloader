@@ -996,6 +996,48 @@ class _FeedPostIterator(Iterator['Post']):
         return post
 
 
+class _AnonymousPostIterator(Iterator['Post']):
+    """Use the web timeline first and switch to the mobile feed only if it fails."""
+
+    def __init__(self, context: InstaloaderContext, primary: Iterator['Post'], user_id: Union[int, str]):
+        self._context = context
+        self._primary = primary
+        self._user_id = user_id
+        self._fallback: Optional[_FeedPostIterator] = None
+        self._seen_mediaids: set[int] = set()
+        self._first_item: Optional['Post'] = None
+
+    def __iter__(self):
+        return self
+
+    @property
+    def first_item(self) -> Optional['Post']:
+        """The newest post yielded so far."""
+        return self._first_item
+
+    def __next__(self) -> 'Post':
+        while True:
+            if self._fallback is None:
+                try:
+                    post = next(self._primary)
+                except (InstaloaderException, KeyError, TypeError) as err:
+                    self._context.log(
+                        "Anonymous web pagination failed ({}). Switching to the mobile fallback."
+                        .format(err)
+                    )
+                    self._fallback = _FeedPostIterator(self._context, self._user_id)
+                    continue
+            else:
+                post = next(self._fallback)
+
+            if post.mediaid in self._seen_mediaids:
+                continue
+            self._seen_mediaids.add(post.mediaid)
+            if self._first_item is None or post.date_local > self._first_item.date_local:
+                self._first_item = post
+            return post
+
+
 class Profile:
     """
     An Instagram Profile.
@@ -1146,18 +1188,10 @@ class Profile:
     @classmethod
     def _resolve_node(cls, context: InstaloaderContext,
                       username: str) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
-        """Resolve a username without repeatedly relying on web_profile_info."""
-        # Anonymous web_profile_info requests are now frequently refused with 401.
-        # The feed endpoint resolves the same public profile and gives us a reusable
-        # first page of posts, so use it first for anonymous downloads.
-        if not context.is_logged_in:
-            feed_node = cls._feed_node(context, username)
-            if feed_node is not None:
-                return feed_node
-
+        """Resolve through the web endpoint, with the mobile feed as a fallback."""
         try:
-            # A refused endpoint should reach the fallback immediately. A subsequent
-            # feed request still uses the configured retry and rate-control policy.
+            # A refused endpoint should reach the fallback immediately. The mobile
+            # request that follows still uses the configured retry and rate control.
             data = context.get_json(
                 "api/v1/users/web_profile_info/", params={"username": username.lower()},
                 _attempt=context.max_connection_attempts
@@ -1177,6 +1211,9 @@ class Profile:
             raise
         if data and data.get("user"):
             return data["user"], None
+        feed_node = cls._feed_node(context, username)
+        if feed_node is not None:
+            return feed_node
         raise ProfileNotExistsException("Profile {} does not exist.".format(username))
 
     @classmethod
@@ -1469,8 +1506,29 @@ class Profile:
 
         :rtype: Iterator[Post]"""
         self._obtain_metadata()
-        if not self._context.is_logged_in:
+        if not self._context.is_logged_in and self._feed_first_page is not None:
             return _FeedPostIterator(self._context, self.userid, first_page=self._feed_first_page)
+        if not self._context.is_logged_in:
+            primary = NodeIterator(
+                context=self._context,
+                edge_extractor=lambda d: d["data"]["user"]["edge_owner_to_timeline_media"],
+                node_wrapper=lambda n: Post(self._context, n, self),
+                query_variables={
+                    "data": {
+                        "count": 12,
+                        "include_relationship_info": True,
+                        "latest_besties_reel_media": True,
+                        "latest_reel_media": True,
+                    },
+                    "id": self.userid,
+                },
+                query_referer="https://www.instagram.com/{0}/".format(self.username),
+                is_first=Profile._make_is_newest_checker(),
+                doc_id="7950326061742207",
+                query_hash=None,
+                first_data=self._metadata("edge_owner_to_timeline_media"),
+            )
+            return _AnonymousPostIterator(self._context, primary, self.userid)
         return NodeIterator(
             context=self._context,
             edge_extractor=(
