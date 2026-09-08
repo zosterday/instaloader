@@ -1,4 +1,4 @@
-"""Unit tests for profile resolution fallbacks."""
+"""Unit tests for anonymous web profile resolution and pagination."""
 
 import unittest
 from datetime import datetime, timezone
@@ -11,7 +11,7 @@ from instaloader.exceptions import (ConnectionException, QueryReturnedBadRequest
 from instaloader.instaloader import Instaloader
 from instaloader.instaloadercontext import InstaloaderContext
 from instaloader.nodeiterator import NodeIterator, resumable_iteration
-from instaloader.structures import (Profile, _AnonymousPostIterator, _FeedPostIterator,
+from instaloader.structures import (FrozenFeedIterator, Profile, _AnonymousPostIterator,
                                     load_structure_from_file, save_structure_to_file)
 
 
@@ -54,6 +54,40 @@ def web_profile_response(username="web_profile", items=None, has_next_page=False
     }
 
 
+def timeline_response(username="business_profile", items=None, has_next_page=False, end_cursor=None):
+    if items is None:
+        items = [{
+            "pk": "post-1",
+            "code": "web-post",
+            "media_type": 1,
+            "taken_at": 1767225600,
+            "caption": None,
+            "has_liked": False,
+            "like_count": 0,
+            "comment_count": 0,
+            "image_versions2": {"candidates": [{"url": "https://example.com/post.jpg"}]},
+            "user": {
+                "pk": "1234",
+                "username": username,
+                "is_private": False,
+                "full_name": "Business Profile",
+                "profile_pic_url": "https://example.com/profile.jpg",
+            },
+        }]
+    return {
+        "status": "ok",
+        "data": {
+            "xdt_api__v1__feed__user_timeline_graphql_connection": {
+                "edges": [{"node": item} for item in items],
+                "page_info": {
+                    "has_next_page": has_next_page,
+                    "end_cursor": end_cursor,
+                },
+            },
+        },
+    }
+
+
 class TestProfileResolution(unittest.TestCase):
 
     def test_anonymous_resolution_prefers_web_profile_info(self):
@@ -71,10 +105,10 @@ class TestProfileResolution(unittest.TestCase):
         )
         context.get_iphone_json.assert_not_called()
 
-    def test_anonymous_resolution_uses_mobile_only_after_web_401(self):
+    def test_anonymous_resolution_uses_web_timeline_after_profile_info_401(self):
         context = Mock(is_logged_in=False, max_connection_attempts=3)
         context.get_json.side_effect = QueryReturnedUnauthorizedException("web profile info failed")
-        context.get_iphone_json.return_value = feed_response()
+        context.doc_id_graphql_query.return_value = timeline_response()
 
         profile = Profile.from_username(context, "Business_Profile")
 
@@ -82,12 +116,11 @@ class TestProfileResolution(unittest.TestCase):
         self.assertEqual(profile.username, "business_profile")
         self.assertFalse(profile.has_blocked_viewer)
         self.assertIsNone(profile.mediacount)
-        context.get_iphone_json.assert_called_once_with(
-            "api/v1/feed/user/business_profile/username/", params={"count": 30}
-        )
         context.get_json.assert_called_once()
+        self.assertEqual(context.doc_id_graphql_query.call_args.args[0], "38154989454116081")
+        context.get_iphone_json.assert_not_called()
 
-    def test_cached_id_is_used_before_mobile_profile_resolution(self):
+    def test_cached_id_is_used_without_native_profile_resolution(self):
         context = Mock(is_logged_in=False, max_connection_attempts=3)
         context.get_json.side_effect = QueryReturnedUnauthorizedException("web profile info failed")
 
@@ -98,33 +131,22 @@ class TestProfileResolution(unittest.TestCase):
         self.assertTrue(profile.is_id_only)
         context.get_iphone_json.assert_not_called()
 
-    def test_cached_id_reaches_mobile_only_after_master_posts_fail(self):
+    def test_cached_id_web_posts_failure_does_not_fall_back_to_mobile(self):
         context = Mock(is_logged_in=False, max_connection_attempts=3)
         context.get_json.side_effect = QueryReturnedUnauthorizedException("web profile info failed")
         context.doc_id_graphql_query.side_effect = QueryReturnedUnauthorizedException("web posts failed")
-        context.get_iphone_json.return_value = feed_response(items=[])
 
         profile = Profile.from_username(context, "Cached_Profile", profile_id=1234)
-        self.assertEqual(context.get_iphone_json.call_count, 0)
-        posts = profile.get_posts()
+        with self.assertRaisesRegex(QueryReturnedUnauthorizedException, "web posts failed"):
+            profile.get_posts()
 
-        self.assertIsInstance(posts, _FeedPostIterator)
         context.doc_id_graphql_query.assert_called_once()
         context.get_iphone_json.assert_not_called()
-        self.assertEqual(list(posts), [])
-        context.get_iphone_json.assert_called_once_with(
-            "api/v1/feed/user/1234/", params={"count": 30}
-        )
 
-    def test_get_posts_keeps_mobile_unused_when_bundled_web_page_is_complete(self):
+    def test_get_posts_uses_current_web_timeline_shape(self):
         context = Mock(is_logged_in=False, max_connection_attempts=3)
-        context.get_json.return_value = web_profile_response(items=[{
-            "id": "1",
-            "shortcode": "web-post",
-            "taken_at_timestamp": 1767225600,
-            "__typename": "GraphImage",
-            "is_video": False,
-        }])
+        context.get_json.return_value = web_profile_response()
+        context.doc_id_graphql_query.return_value = timeline_response(username="web_profile")
         profile = Profile.from_username(context, "Web_Profile")
 
         posts = profile.get_posts()
@@ -133,6 +155,37 @@ class TestProfileResolution(unittest.TestCase):
         self.assertEqual(next(posts).shortcode, "web-post")
         with self.assertRaises(StopIteration):
             next(posts)
+        self.assertEqual(context.doc_id_graphql_query.call_args.args[0], "38154989454116081")
+        context.get_iphone_json.assert_not_called()
+
+    def test_anonymous_web_timeline_paginates_with_relay_cursor(self):
+        context = Mock(is_logged_in=False, max_connection_attempts=3)
+        context.get_json.return_value = web_profile_response()
+        first_node = {"pk": "post-1"}
+        second_node = {"pk": "post-2"}
+        context.doc_id_graphql_query.side_effect = [
+            timeline_response(items=[first_node], has_next_page=True, end_cursor="cursor-1"),
+            timeline_response(items=[second_node]),
+        ]
+        posts = {
+            "post-1": Mock(date_local=datetime(2026, 1, 2)),
+            "post-2": Mock(date_local=datetime(2026, 1, 1)),
+        }
+        profile = Profile.from_username(context, "Web_Profile")
+
+        with patch(
+            "instaloader.structures.Post.from_iphone_struct",
+            side_effect=lambda _context, node: posts[node["pk"]],
+        ):
+            self.assertEqual(list(profile.get_posts()), [posts["post-1"], posts["post-2"]])
+
+        first_variables = context.doc_id_graphql_query.call_args_list[0].args[1]
+        second_variables = context.doc_id_graphql_query.call_args_list[1].args[1]
+        self.assertNotIn("after", first_variables)
+        self.assertEqual(second_variables["after"], "cursor-1")
+        self.assertEqual(second_variables["first"], 12)
+        self.assertEqual(first_variables["data"]["count"], 12)
+        self.assertEqual(first_variables["username"], "web_profile")
         context.get_iphone_json.assert_not_called()
 
     def test_logged_in_resolution_falls_back_to_feed_after_401(self):
@@ -168,23 +221,19 @@ class TestProfileResolution(unittest.TestCase):
         with self.assertRaisesRegex(QueryReturnedUnauthorizedException, "original failure"):
             Profile.from_username(context, "empty_profile")
 
-    def test_get_posts_reuses_feed_first_page(self):
+    def test_get_posts_reuses_web_timeline_resolution_page(self):
         context = Mock(is_logged_in=False, max_connection_attempts=3)
         context.get_json.side_effect = QueryReturnedUnauthorizedException("web profile info failed")
-        context.get_iphone_json.return_value = feed_response(items=[{"pk": "post-1"}])
+        context.doc_id_graphql_query.return_value = timeline_response()
         profile = Profile.from_username(context, "Business_Profile")
-        post = Mock(date_local=datetime(2026, 1, 1))
 
-        with patch("instaloader.structures.Post.from_iphone_struct", return_value=post) as from_struct:
-            posts = profile.get_posts()
-            self.assertIs(next(posts), post)
-            with self.assertRaises(StopIteration):
-                next(posts)
+        posts = profile.get_posts()
+        self.assertEqual(next(posts).shortcode, "web-post")
+        with self.assertRaises(StopIteration):
+            next(posts)
 
-        context.get_json.assert_called_once()
-        self.assertEqual(context.get_iphone_json.call_count, 1)
-        context.doc_id_graphql_query.assert_not_called()
-        from_struct.assert_called_once_with(context, {"pk": "post-1"})
+        context.doc_id_graphql_query.assert_called_once()
+        context.get_iphone_json.assert_not_called()
 
 
 class TestCachedProfileID(unittest.TestCase):
@@ -202,162 +251,6 @@ class TestCachedProfileID(unittest.TestCase):
         from_username.assert_called_once_with(
             loader.context, "cached_profile", profile_id=1234
         )
-
-
-class TestFeedPostIterator(unittest.TestCase):
-
-    def test_spaces_fallback_page_requests(self):
-        context = Mock(sleep=True)
-        context.get_iphone_json.return_value = {"items": [], "more_available": False}
-        iterator = _FeedPostIterator(context, 1234, first_page=feed_response())
-
-        iterator._query("cursor-1")
-
-        context.do_sleep.assert_called_once_with(6.0, 12.0)
-        context.get_iphone_json.assert_called_once_with(
-            "api/v1/feed/user/1234/", params={"count": 30, "max_id": "cursor-1"}
-        )
-
-    def test_paginates_with_max_id_and_tracks_newest_post(self):
-        context = Mock()
-        context.get_iphone_json.return_value = {
-            "items": [{"pk": "post-2"}],
-            "more_available": False,
-        }
-        first_page = feed_response(
-            items=[{"pk": "post-1"}], more_available=True, next_max_id="cursor-1"
-        )
-        posts_by_id = {
-            "post-1": Mock(date_local=datetime(2026, 1, 1)),
-            "post-2": Mock(date_local=datetime(2026, 1, 2)),
-        }
-
-        with patch(
-            "instaloader.structures.Post.from_iphone_struct",
-            side_effect=lambda _context, item: posts_by_id[item["pk"]],
-        ):
-            iterator = _FeedPostIterator(context, 1234, first_page=first_page)
-            self.assertEqual(list(iterator), [posts_by_id["post-1"], posts_by_id["post-2"]])
-
-        context.get_iphone_json.assert_called_once_with(
-            "api/v1/feed/user/1234/",
-            params={"count": 30, "max_id": "cursor-1"},
-        )
-        self.assertIs(iterator.first_item, posts_by_id["post-2"])
-
-    def test_failure_saves_checkpoint_and_next_run_retries_only_last_post(self):
-        context = Mock(username=None)
-        first_page = feed_response(items=[{"pk": "post-1"}, {"pk": "post-2"}])
-        posts_by_id = {
-            "post-1": Mock(
-                date_local=datetime(2026, 1, 2, tzinfo=timezone.utc),
-                _node={"id": "1", "shortcode": "one", "taken_at_timestamp": 1767312000},
-            ),
-            "post-2": Mock(
-                date_local=datetime(2026, 1, 1, tzinfo=timezone.utc),
-                _node={"id": "2", "shortcode": "two", "taken_at_timestamp": 1767225600},
-            ),
-        }
-
-        with TemporaryDirectory() as temp_dir, patch(
-            "instaloader.structures.Post.from_iphone_struct",
-            side_effect=lambda _context, item: posts_by_id[item["pk"]],
-        ):
-            resume_path = str(Path(temp_dir) / "resume.json.xz")
-            iterator = _FeedPostIterator(context, 1234, first_page=first_page)
-            with self.assertRaisesRegex(RuntimeError, "download failed"):
-                with resumable_iteration(
-                    context,
-                    iterator,
-                    load_structure_from_file,
-                    save_structure_to_file,
-                    lambda _magic: resume_path,
-                ):
-                    self.assertIs(next(iterator), posts_by_id["post-1"])
-                    raise RuntimeError("download failed")
-
-            self.assertTrue(Path(resume_path).is_file())
-            resumed_iterator = _FeedPostIterator(context, 1234, first_page=first_page)
-            with resumable_iteration(
-                context,
-                resumed_iterator,
-                load_structure_from_file,
-                save_structure_to_file,
-                lambda _magic: resume_path,
-            ) as (is_resuming, start_index):
-                self.assertTrue(is_resuming)
-                self.assertEqual(start_index, 0)
-                self.assertEqual(
-                    list(resumed_iterator),
-                    [posts_by_id["post-1"], posts_by_id["post-2"]],
-                )
-
-            self.assertFalse(Path(resume_path).exists())
-
-    def test_failed_later_page_resumes_at_failed_cursor_without_replaying_earlier_pages(self):
-        context = Mock(username=None)
-        first_page = feed_response(
-            items=[{"pk": "post-1"}, {"pk": "post-2"}],
-            more_available=True,
-            next_max_id="cursor-1",
-        )
-        second_page = {
-            "items": [{"pk": "post-3"}, {"pk": "post-4"}],
-            "more_available": True,
-            "next_max_id": "cursor-2",
-        }
-        final_page = {"items": [{"pk": "post-5"}], "more_available": False}
-        posts_by_id = {
-            "post-{}".format(number): Mock(
-                date_local=datetime(2026, 1, number, tzinfo=timezone.utc),
-                _node={
-                    "id": str(number),
-                    "shortcode": "post-{}".format(number),
-                    "taken_at_timestamp": 1767225600 + number,
-                },
-            )
-            for number in range(1, 6)
-        }
-        context.get_iphone_json.side_effect = [second_page, ConnectionException("page refused")]
-
-        with TemporaryDirectory() as temp_dir, patch(
-            "instaloader.structures.Post.from_iphone_struct",
-            side_effect=lambda _context, item: posts_by_id[item["pk"]],
-        ):
-            resume_path = str(Path(temp_dir) / "resume.json.xz")
-            iterator = _FeedPostIterator(context, 1234, first_page=first_page)
-            with self.assertRaisesRegex(ConnectionException, "page refused"):
-                with resumable_iteration(
-                    context,
-                    iterator,
-                    load_structure_from_file,
-                    save_structure_to_file,
-                    lambda _magic: resume_path,
-                ):
-                    list(iterator)
-
-            self.assertEqual(context.get_iphone_json.call_count, 2)
-            context.get_iphone_json.reset_mock(side_effect=True)
-            context.get_iphone_json.return_value = final_page
-            resumed_iterator = _FeedPostIterator(context, 1234)
-            context.get_iphone_json.assert_not_called()
-            with resumable_iteration(
-                context,
-                resumed_iterator,
-                load_structure_from_file,
-                save_structure_to_file,
-                lambda _magic: resume_path,
-            ) as (is_resuming, start_index):
-                self.assertTrue(is_resuming)
-                self.assertEqual(start_index, 3)
-                self.assertEqual(
-                    list(resumed_iterator),
-                    [posts_by_id["post-4"], posts_by_id["post-5"]],
-                )
-
-            context.get_iphone_json.assert_called_once_with(
-                "api/v1/feed/user/1234/", params={"count": 30, "max_id": "cursor-2"}
-            )
 
 
 class TestAnonymousPostIterator(unittest.TestCase):
@@ -420,14 +313,14 @@ class TestAnonymousPostIterator(unittest.TestCase):
                 self.assertEqual(start_index, 0)
                 self.assertEqual(list(resumed_hybrid), [posts["1"], posts["2"]])
 
-    def test_uses_same_resume_identity_as_mobile_iterator(self):
+    def test_resume_identity_is_stable_and_filename_safe(self):
         context = Mock(username=None)
-        feed = _FeedPostIterator(context, 1234, first_page=feed_response())
-        hybrid = _AnonymousPostIterator(context, iter(()), 1234)
+        first = _AnonymousPostIterator(context, iter(()), 1234)
+        second = _AnonymousPostIterator(context, iter(()), 1234)
 
-        self.assertEqual(feed.magic, hybrid.magic)
-        self.assertNotIn('/', feed.magic)
-        self.assertNotIn('+', feed.magic)
+        self.assertEqual(first.magic, second.magic)
+        self.assertNotIn('/', first.magic)
+        self.assertNotIn('+', first.magic)
 
     def test_keeps_mobile_unused_when_web_iterator_succeeds(self):
         context = Mock()
@@ -465,26 +358,18 @@ class TestAnonymousPostIterator(unittest.TestCase):
             date_local=datetime(2026, 1, 2, tzinfo=timezone.utc),
             _node={"id": "1", "shortcode": "one", "taken_at_timestamp": 1767312000},
         )
-        fallback_page = {
-            "items": [{"pk": "post-1"}],
-            "more_available": False,
-        }
-        with TemporaryDirectory() as temp_dir, patch(
-            "instaloader.structures.Post.from_iphone_struct",
-            return_value=web_post,
-        ):
+        with TemporaryDirectory() as temp_dir:
             resume_path = str(Path(temp_dir) / "resume.json.xz")
-            mobile = _FeedPostIterator(context, 1234, first_page=fallback_page)
-            with self.assertRaisesRegex(RuntimeError, "download failed"):
-                with resumable_iteration(
-                    context,
-                    mobile,
-                    load_structure_from_file,
-                    save_structure_to_file,
-                    lambda _magic: resume_path,
-                ):
-                    self.assertIs(next(mobile), web_post)
-                    raise RuntimeError("download failed")
+            save_structure_to_file(FrozenFeedIterator(
+                user_id="1234",
+                context_username=None,
+                total_index=0,
+                best_before=datetime(2026, 12, 1).timestamp(),
+                data={"items": [{"pk": "post-1"}], "more_available": False},
+                page_index=0,
+                seen_cursors=[],
+                first_node=None,
+            ), resume_path)
 
             primary = NodeIterator(
                 context,

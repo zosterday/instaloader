@@ -952,7 +952,7 @@ class Post:
 
 
 class FrozenFeedIterator(NamedTuple):
-    """Serializable state of an anonymous mobile-feed iterator."""
+    """Legacy mobile-feed checkpoint, retained so old resume files can be rejected safely."""
     user_id: str
     context_username: Optional[str]
     total_index: int
@@ -976,112 +976,30 @@ class FrozenAnonymousIterator(NamedTuple):
     first_node: Optional[Dict[str, Any]]
 
 
+_PROFILE_POSTS_DOC_ID = "38154989454116081"
+
+
+def _profile_posts_query_variables(username: str) -> Dict[str, Any]:
+    """Return the variables required by the current public web profile-post query."""
+    return {
+        "data": {
+            "count": NodeIterator.page_length(),
+            "include_relationship_info": True,
+            "latest_besties_reel_media": True,
+            "latest_reel_media": True,
+        },
+        "username": username.lower(),
+        "__relay_internal__pv__PolarisMultiCaptionCarouselEnabledrelayprovider": False,
+        "__relay_internal__pv__PolarisShortDramaEnabledrelayprovider": False,
+        "__relay_internal__pv__PolarisReelsRecoDebugOverlayEnabledrelayprovider": False,
+    }
+
+
 def _anonymous_iterator_magic(context: InstaloaderContext, user_id: Union[int, str]) -> str:
-    """Return one resume identity regardless of the currently available endpoint."""
+    """Return the resume identity for anonymous web profile posts."""
     magic_hash = hashlib.blake2b(digest_size=6)
     magic_hash.update(json.dumps(['anonymous-profile-posts', str(user_id), context.username]).encode())
     return b64encode(magic_hash.digest(), b'-_').decode()
-
-
-class _FeedPostIterator(Iterator['Post']):
-    """Iterate a user's timeline through the mobile feed endpoint."""
-
-    _page_size = 30
-    _request_interval = (6.0, 12.0)
-
-    def __init__(self, context: InstaloaderContext, user_id: Union[int, str],
-                 first_page: Optional[Dict[str, Any]] = None):
-        self._context = context
-        self._user_id = user_id
-        # Keep the initial request lazy.  resumable_iteration() is entered only
-        # after this object is constructed, and must get a chance to thaw a
-        # saved cursor before any request for the first page is made.
-        self._data = first_page
-        self._page_index = 0
-        self._total_index = 0
-        self._first_item: Optional['Post'] = None
-        self._seen_cursors: set[str] = set()
-        self._best_before = datetime.now().timestamp() + 29 * 24 * 60 * 60
-
-    def __iter__(self):
-        return self
-
-    def _query(self, max_id: Optional[str] = None) -> Dict[str, Any]:
-        params: Dict[str, Any] = {'count': self._page_size}
-        if max_id is not None:
-            params['max_id'] = max_id
-        self._context.do_sleep(*self._request_interval)
-        data = self._context.get_iphone_json(
-            'api/v1/feed/user/{0}/'.format(self._user_id), params=params
-        )
-        self._best_before = datetime.now().timestamp() + 29 * 24 * 60 * 60
-        return data
-
-    @property
-    def magic(self) -> str:
-        """Stable resume-file identifier shared by both anonymous post iterators."""
-        return _anonymous_iterator_magic(self._context, self._user_id)
-
-    @property
-    def total_index(self) -> int:
-        """Number of posts already yielded."""
-        return self._total_index
-
-    @property
-    def first_item(self) -> Optional['Post']:
-        """The newest post yielded so far."""
-        return self._first_item
-
-    def __next__(self) -> 'Post':
-        if self._data is None:
-            self._data = self._query()
-        items = self._data.get('items', [])
-        while self._page_index >= len(items):
-            next_max_id = self._data.get('next_max_id')
-            if not self._data.get('more_available') or not next_max_id or next_max_id in self._seen_cursors:
-                raise StopIteration()
-            next_data = self._query(next_max_id)
-            self._seen_cursors.add(next_max_id)
-            self._data = next_data
-            self._page_index = 0
-            items = self._data.get('items', [])
-        item = items[self._page_index]
-        self._page_index += 1
-        self._total_index += 1
-        post = Post.from_iphone_struct(self._context, item)
-        if self._first_item is None or post.date_local > self._first_item.date_local:
-            self._first_item = post
-        return post
-
-    def freeze(self) -> 'FrozenFeedIterator':
-        """Return a checkpoint that retries the last yielded post when resumed."""
-        return FrozenFeedIterator(
-            user_id=str(self._user_id),
-            context_username=self._context.username,
-            total_index=max(self._total_index - 1, 0),
-            best_before=self._best_before,
-            data=self._data,
-            page_index=max(self._page_index - 1, 0),
-            seen_cursors=sorted(self._seen_cursors),
-            first_node=self._first_item._node if self._first_item is not None else None,
-        )
-
-    def thaw(self, frozen: Any) -> None:
-        """Restore a mobile-feed checkpoint."""
-        if isinstance(frozen, FrozenAnonymousIterator) and frozen.mode == 'fallback' and frozen.fallback is not None:
-            nested = FrozenFeedIterator(**frozen.fallback)
-            frozen = nested._replace(total_index=frozen.total_index)
-        if not isinstance(frozen, FrozenFeedIterator):
-            raise InvalidArgumentException("Mismatching resume information.")
-        if str(self._user_id) != frozen.user_id or self._context.username != frozen.context_username:
-            raise InvalidArgumentException("Mismatching resume information.")
-        self._total_index = frozen.total_index
-        self._best_before = frozen.best_before
-        self._data = frozen.data
-        self._page_index = frozen.page_index
-        self._seen_cursors = set(frozen.seen_cursors)
-        if frozen.first_node is not None:
-            self._first_item = Post(self._context, frozen.first_node)
 
 
 class _AnonymousPostIterator(Iterator['Post']):
@@ -1105,7 +1023,7 @@ class _AnonymousPostIterator(Iterator['Post']):
 
     @property
     def magic(self) -> str:
-        """Stable resume-file identifier shared by both anonymous post iterators."""
+        """Stable resume-file identifier for anonymous web pagination."""
         return _anonymous_iterator_magic(self._context, self._user_id)
 
     @property
@@ -1187,7 +1105,7 @@ class Profile:
         self._node = node
         self._has_full_metadata = False
         self._iphone_struct_ = None
-        self._feed_first_page: Optional[Dict[str, Any]] = None
+        self._web_posts_first_page: Optional[Dict[str, Any]] = None
         self._is_id_only = False
         if 'iphone_struct' in node:
             # if loaded from JSON with load_structure_from_file()
@@ -1202,14 +1120,14 @@ class Profile:
 
         :param context: :attr:`Instaloader.context`
         :param username: Username
-        :param profile_id: Optional locally stored ID to try before mobile resolution.
+        :param profile_id: Optional locally stored ID to use if web profile metadata is unavailable.
         :raises: :class:`ProfileNotExistsException`
         """
-        node, feed_first_page, is_id_only = cls._resolve_node(context, username, profile_id)
+        node, web_posts_first_page, is_id_only = cls._resolve_node(context, username, profile_id)
         profile = cls(context, node)
-        profile._feed_first_page = feed_first_page
+        profile._web_posts_first_page = web_posts_first_page
         profile._is_id_only = is_id_only
-        profile._has_full_metadata = is_id_only or feed_first_page is None or not context.is_logged_in
+        profile._has_full_metadata = is_id_only or web_posts_first_page is None or not context.is_logged_in
         return profile
 
     def _obtain_metadata_graphql(self):
@@ -1279,11 +1197,10 @@ class Profile:
     @staticmethod
     def _feed_node(context: InstaloaderContext,
                    username: str) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
-        """Fetch a profile node and first post page through the mobile feed endpoint."""
+        """Fetch a logged-in profile node through the native feed endpoint."""
         path = "api/v1/feed/user/{0}/username/".format(username.lower())
         try:
-            query_feed = context.get_json if context.is_logged_in else context.get_iphone_json
-            feed = query_feed(path, params={"count": _FeedPostIterator._page_size})
+            feed = context.get_json(path, params={"count": 30})
         except TooManyRequestsException:
             raise
         except (QueryReturnedBadRequestException, QueryReturnedUnauthorizedException, ConnectionException):
@@ -1299,18 +1216,43 @@ class Profile:
             "profile_pic_url_hd": user["profile_pic_url"],
             "iphone_struct": user,
         }
-        if not context.is_logged_in:
-            # The feed omits the total count. None keeps progress output honest and
-            # prevents another request to the endpoint that just returned 401.
-            node["edge_owner_to_timeline_media"] = {"count": None}
         return Profile._normalize_profile_data(node), feed
+
+    @classmethod
+    def _web_timeline_node(cls, context: InstaloaderContext,
+                           username: str) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        """Resolve a public profile from the first page of the web timeline query."""
+        response = context.doc_id_graphql_query(
+            _PROFILE_POSTS_DOC_ID,
+            {
+                **_profile_posts_query_variables(username),
+                "after": None,
+                "before": None,
+                "first": NodeIterator.page_length(),
+                "last": None,
+            },
+            "https://www.instagram.com/{0}/".format(username.lower()),
+        )
+        timeline = ((response.get("data") or {})
+                    .get("xdt_api__v1__feed__user_timeline_graphql_connection"))
+        if not isinstance(timeline, dict):
+            return None
+        edges = timeline.get("edges") or []
+        if not edges:
+            return None
+        user = (edges[0].get("node") or {}).get("user")
+        if not isinstance(user, dict) or not user.get("pk") or not user.get("username"):
+            return None
+        node = cls._normalize_profile_data(user)
+        node.setdefault("edge_owner_to_timeline_media", {"count": None})
+        return node, timeline
 
     @classmethod
     def _resolve_node(cls, context: InstaloaderContext,
                       username: str,
                       profile_id: Optional[int] = None
                       ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], bool]:
-        """Resolve through the web endpoint, with the mobile feed as a fallback."""
+        """Resolve a profile without using native endpoints for anonymous requests."""
         try:
             data = context.get_json(
                 "api/v1/users/web_profile_info/", params={"username": username.lower()},
@@ -1320,12 +1262,20 @@ class Profile:
             data = None
         except (QueryReturnedBadRequestException, QueryReturnedUnauthorizedException, ConnectionException) as err:
             if profile_id is not None and not context.is_logged_in:
-                context.log("Web profile lookup failed; trying stored profile ID {} before mobile."
+                context.log("Web profile lookup failed; using stored profile ID {} for web posts."
                             .format(profile_id), flush=True)
                 return cls._cached_id_node(username, profile_id), None, True
+            if not context.is_logged_in:
+                timeline_node = cls._web_timeline_node(context, username)
+                if timeline_node is not None:
+                    return timeline_node[0], timeline_node[1], False
+                raise ProfileNotExistsException(
+                    "Profile {} could not be resolved through anonymous web endpoints."
+                    .format(username)
+                ) from err
             feed_node = cls._feed_node(context, username)
             if feed_node is not None:
-                return feed_node[0], feed_node[1], False
+                return feed_node[0], None, False
             if isinstance(err, QueryReturnedBadRequestException):
                 raise ProfileNotExistsException(
                     "Profile {} could not be retrieved.{}".format(
@@ -1336,12 +1286,20 @@ class Profile:
         if data and data.get("user"):
             return data["user"], None, False
         if profile_id is not None and not context.is_logged_in:
-            context.log("Web profile lookup returned no user; trying stored profile ID {} before mobile."
+            context.log("Web profile lookup returned no user; using stored profile ID {} for web posts."
                         .format(profile_id), flush=True)
             return cls._cached_id_node(username, profile_id), None, True
+        if not context.is_logged_in:
+            timeline_node = cls._web_timeline_node(context, username)
+            if timeline_node is not None:
+                return timeline_node[0], timeline_node[1], False
+            raise ProfileNotExistsException(
+                "Profile {} could not be resolved through anonymous web endpoints."
+                .format(username)
+            )
         feed_node = cls._feed_node(context, username)
         if feed_node is not None:
-            return feed_node[0], feed_node[1], False
+            return feed_node[0], None, False
         raise ProfileNotExistsException("Profile {} does not exist.".format(username))
 
     @staticmethod
@@ -1382,7 +1340,7 @@ class Profile:
         try:
             if not self._has_full_metadata:
                 if not self._context.is_logged_in:
-                    self._node, self._feed_first_page, self._is_id_only = self._resolve_node(
+                    self._node, self._web_posts_first_page, self._is_id_only = self._resolve_node(
                         self._context, self.username
                     )
                     self._has_full_metadata = True
@@ -1653,63 +1611,22 @@ class Profile:
 
         :rtype: Iterator[Post]"""
         self._obtain_metadata()
-        if not self._context.is_logged_in and self._feed_first_page is not None:
-            return _FeedPostIterator(self._context, self.userid, first_page=self._feed_first_page)
-        if not self._context.is_logged_in:
-            try:
-                primary = NodeIterator(
-                    context=self._context,
-                    edge_extractor=lambda d: d["data"]["user"]["edge_owner_to_timeline_media"],
-                    node_wrapper=lambda n: Post(self._context, n, self),
-                    query_variables={
-                        "data": {
-                            "count": 12,
-                            "include_relationship_info": True,
-                            "latest_besties_reel_media": True,
-                            "latest_reel_media": True,
-                        },
-                        "id": self.userid,
-                    },
-                    query_referer="https://www.instagram.com/{0}/".format(self.username),
-                    is_first=Profile._make_is_newest_checker(),
-                    doc_id="7950326061742207",
-                    query_hash=None,
-                    first_data=(None if self._feed_first_page is not None or self._is_id_only
-                                else self._metadata("edge_owner_to_timeline_media")),
-                )
-            except (InstaloaderException, KeyError, TypeError) as err:
-                self._context.log(
-                    "Anonymous web post pagination could not be started ({}). Using the mobile fallback."
-                    .format(err), flush=True
-                )
-                return _FeedPostIterator(
-                    self._context, self.userid, first_page=self._feed_first_page
-                )
-            return _AnonymousPostIterator(self._context, primary, self.userid)
-        return NodeIterator(
+        primary = NodeIterator(
             context=self._context,
             edge_extractor=(
                 lambda d: d["data"]["xdt_api__v1__feed__user_timeline_graphql_connection"]
             ),
             node_wrapper=lambda n: Post.from_iphone_struct(self._context, n),
-            query_variables={
-                "data": {
-                    "count": 12,
-                    "include_relationship_info": True,
-                    "latest_besties_reel_media": True,
-                    "latest_reel_media": True,
-                },
-                "username": self.username,
-                "__relay_internal__pv__PolarisMultiCaptionCarouselEnabledrelayprovider": False,
-                "__relay_internal__pv__PolarisShortDramaEnabledrelayprovider": False,
-                "__relay_internal__pv__PolarisReelsRecoDebugOverlayEnabledrelayprovider": False,
-            },
+            query_variables=_profile_posts_query_variables(self.username),
             query_referer="https://www.instagram.com/{0}/".format(self.username),
             is_first=Profile._make_is_newest_checker(),
-            doc_id="27774912572190533",
+            doc_id=_PROFILE_POSTS_DOC_ID,
             query_hash=None,
-            first_data=None,
+            first_data=(self._web_posts_first_page if not self._context.is_logged_in else None),
         )
+        if not self._context.is_logged_in:
+            return _AnonymousPostIterator(self._context, primary, self.userid)
+        return primary
 
     def get_saved_posts(self) -> NodeIterator[Post]:
         """Get Posts that are marked as saved by the user.
