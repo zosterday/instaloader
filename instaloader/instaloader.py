@@ -1,6 +1,7 @@
 import getpass
 import json
 import os
+from itertools import islice
 import platform
 import re
 import shutil
@@ -1035,7 +1036,7 @@ class Instaloader:
         with resumable_iteration(
                 context=self.context,
                 iterator=posts,
-                load=load_structure_from_file,
+                load=lambda context, path: load_structure_from_file(context, path, frozen_only=True),
                 save=save_structure_to_file,
                 format_path=lambda magic: self.format_filename_within_target_path(
                     sanitized_target, owner_profile, self.resume_prefix or '', magic, 'json.xz'
@@ -1043,7 +1044,9 @@ class Instaloader:
                 check_bbd=self.check_resume_bbd,
                 enabled=self.resume_prefix is not None
         ) as (is_resuming, start_index):
-            for number, post in enumerate(posts, start=start_index + 1):
+            # Bound iteration before fetching the next post's lazy metadata.
+            limited_posts = islice(posts, max(0, max_count - start_index)) if max_count is not None else posts
+            for number, post in enumerate(limited_posts, start=start_index + 1):
                 should_stop = not takewhile(post)
                 if should_stop and number <= possibly_pinned:
                     continue

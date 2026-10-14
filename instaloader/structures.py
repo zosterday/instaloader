@@ -13,7 +13,8 @@ from unicodedata import normalize
 from . import __version__
 from .exceptions import *
 from .instaloadercontext import InstaloaderContext
-from .nodeiterator import FrozenNodeIterator, NodeIterator
+from .nodeiterator import (FrozenNodeIterator, NodeIterator, _frozen_iterator_data,
+                          _validate_frozen_common, _validate_frozen_node)
 from .sectioniterator import SectionIterator
 
 
@@ -307,7 +308,7 @@ class Post:
         pic_json["video_duration"] = media.get("video_duration")
         pic_json["video_view_count"] = media.get("view_count")
         pic_json["video_play_count"] = media.get("play_count")
-        if media_type == 2 and pic_json["video_view_count"] is None:
+        if media_type == 2 and pic_json["video_view_count"] is None and context.is_logged_in:
             pic_json["video_play_count"] = Post._fetch_play_count_from_clips(
                 context, media["user"]["pk"], media["code"]
             )
@@ -414,6 +415,21 @@ class Post:
 
     def _obtain_metadata(self):
         if not self._full_metadata_dict:
+            if not self._context.is_logged_in:
+                for data in self._context.get_page_data('p/{}/'.format(self.shortcode)):
+                    media = data.get('xig_polaris_media')
+                    if not isinstance(media, dict):
+                        continue
+                    if media.get('gating_ruling') or not isinstance(media.get('if_not_gated_logged_out'), dict):
+                        raise LoginRequiredException('Public post metadata is restricted by Instagram.')
+                    details = media['if_not_gated_logged_out']
+                    if details.get('code') != self.shortcode:
+                        raise BadResponseException('Public post page returned a different shortcode.')
+                    try:
+                        self._full_metadata_dict = Post._normalize_post_data(details, self._context)
+                    except (KeyError, TypeError, ValueError) as exc:
+                        raise BadResponseException('Public post page has incomplete media data.') from exc
+                    return
             resp = self._context.doc_id_graphql_query(
                 "27128499623469141",
                 {
@@ -961,6 +977,7 @@ class FrozenFeedIterator(NamedTuple):
     page_index: int
     seen_cursors: List[str]
     first_node: Optional[Dict[str, Any]]
+    extra_fields: Optional[Dict[str, Any]] = None
 
 
 class FrozenAnonymousIterator(NamedTuple):
@@ -974,9 +991,68 @@ class FrozenAnonymousIterator(NamedTuple):
     fallback: Optional[Dict[str, Any]]
     seen_mediaids: List[int]
     first_node: Optional[Dict[str, Any]]
+    extra_fields: Optional[Dict[str, Any]] = None
 
 
-_PROFILE_POSTS_DOC_ID = "38154989454116081"
+def _load_frozen_iterator(node_type: str, state: Dict[str, Any]) -> Any:
+    """Read known checkpoint schemas while retaining forward extension fields."""
+    schemas: Dict[str, Any] = {'FrozenNodeIterator': FrozenNodeIterator, 'FrozenFeedIterator': FrozenFeedIterator,
+               'FrozenAnonymousIterator': FrozenAnonymousIterator}
+    schema = schemas[node_type]
+    if not isinstance(state, dict):
+        raise InvalidArgumentException('Invalid resume state: expected an object.')
+    data = state.copy()
+    data.setdefault('first_node', None)
+    if schema is FrozenNodeIterator:
+        data.setdefault('doc_id', None)
+    extensions = data.pop('extra_fields', None)
+    if extensions is None:
+        extensions = {}
+    if not isinstance(extensions, dict):
+        raise InvalidArgumentException('Invalid resume extension fields.')
+    extensions = {**extensions, **{key: value for key, value in data.items() if key not in schema._fields}}
+    try:
+        frozen = schema(**{key: value for key, value in data.items() if key in schema._fields},
+                        extra_fields=extensions or None)
+    except TypeError as exc:
+        raise InvalidArgumentException('Incomplete {} resume state.'.format(node_type)) from exc
+    if schema is FrozenNodeIterator:
+        _validate_frozen_node(frozen)
+        return frozen
+    _validate_frozen_common(frozen)
+    if not isinstance(frozen.user_id, str) or not frozen.user_id.isdigit() or int(frozen.user_id) <= 0:
+        raise InvalidArgumentException('Invalid resume user_id.')
+    if schema is FrozenAnonymousIterator:
+        if (frozen.mode not in ('primary', 'fallback') or not isinstance(frozen.seen_mediaids, list)
+                or any(not isinstance(item, int) or isinstance(item, bool) or item <= 0
+                       for item in frozen.seen_mediaids)):
+            raise InvalidArgumentException('Invalid anonymous resume mode or media IDs.')
+        for field, nested_type in [('primary', 'FrozenNodeIterator'), ('fallback', 'FrozenFeedIterator')]:
+            nested = getattr(frozen, field)
+            if nested is not None:
+                parsed = _load_frozen_iterator(nested_type, nested)
+                if parsed.context_username != frozen.context_username:
+                    raise InvalidArgumentException('Mismatching nested resume context.')
+                if field == 'fallback' and parsed.user_id != frozen.user_id:
+                    raise InvalidArgumentException('Mismatching nested resume identity.')
+        if getattr(frozen, frozen.mode) is None:
+            raise InvalidArgumentException('Active anonymous resume cursor missing.')
+    else:
+        if (not isinstance(frozen.page_index, int) or isinstance(frozen.page_index, bool)
+                or frozen.page_index < 0):
+            raise InvalidArgumentException('Invalid mobile resume page_index.')
+        if not isinstance(frozen.seen_cursors, list) or any(not isinstance(c, str) for c in frozen.seen_cursors):
+            raise InvalidArgumentException('Invalid mobile resume seen_cursors.')
+        if frozen.data is None:
+            if frozen.page_index != 0:
+                raise InvalidArgumentException('Invalid mobile resume data or cursor.')
+        elif (not isinstance(frozen.data, dict) or not isinstance(frozen.data.get('items'), list)
+              or frozen.page_index > len(frozen.data['items'])):
+            raise InvalidArgumentException('Invalid mobile resume data or cursor.')
+    return frozen
+
+
+_PROFILE_POSTS_DOC_ID = "28975909992013618"
 
 
 def _profile_posts_query_variables(username: str) -> Dict[str, Any]:
@@ -984,12 +1060,15 @@ def _profile_posts_query_variables(username: str) -> Dict[str, Any]:
     return {
         "data": {
             "count": NodeIterator.page_length(),
+            "include_reel_media_seen_timestamp": True,
             "include_relationship_info": True,
             "latest_besties_reel_media": True,
             "latest_reel_media": True,
         },
         "username": username.lower(),
-        "__relay_internal__pv__PolarisMultiCaptionCarouselEnabledrelayprovider": False,
+        "first": NodeIterator.page_length(),
+        "include_multi_captions": True,
+        "__relay_internal__pv__PolarisMultiCaptionCarouselEnabledrelayprovider": True,
         "__relay_internal__pv__PolarisShortDramaEnabledrelayprovider": False,
         "__relay_internal__pv__PolarisReelsRecoDebugOverlayEnabledrelayprovider": False,
     }
@@ -1012,6 +1091,8 @@ class _AnonymousPostIterator(Iterator['Post']):
         self._first_item: Optional['Post'] = None
         self._total_index = 0
         self._best_before = datetime.now().timestamp() + 29 * 24 * 60 * 60
+        self._extra_fields: Optional[Dict[str, Any]] = None
+        self._seen_mediaids: set[int] = set()
 
     def __iter__(self):
         return self
@@ -1033,6 +1114,8 @@ class _AnonymousPostIterator(Iterator['Post']):
 
     def __next__(self) -> 'Post':
         post = next(self._primary)
+        while self._seen_mediaids and post.mediaid in self._seen_mediaids:
+            post = next(self._primary)
         self._total_index += 1
         if self._first_item is None or post.date_local > self._first_item.date_local:
             self._first_item = post
@@ -1040,7 +1123,8 @@ class _AnonymousPostIterator(Iterator['Post']):
 
     def freeze(self) -> 'FrozenAnonymousIterator':
         """Return a checkpoint for the master-style web iterator."""
-        primary = self._primary.freeze()._asdict() if isinstance(self._primary, NodeIterator) else None
+        # pylint:disable=protected-access
+        primary = _frozen_iterator_data(self._primary.freeze()) if isinstance(self._primary, NodeIterator) else None
         return FrozenAnonymousIterator(
             user_id=str(self._user_id),
             context_username=self._context.username,
@@ -1049,25 +1133,55 @@ class _AnonymousPostIterator(Iterator['Post']):
             mode='primary',
             primary=primary,
             fallback=None,
-            seen_mediaids=[],
+            seen_mediaids=sorted(self._seen_mediaids),
             first_node=self._first_item._node if self._first_item is not None else None,
+            extra_fields=self._extra_fields,
         )
 
     def thaw(self, frozen: Any) -> None:
         """Restore a web checkpoint, rejecting mobile cursors that cannot be translated."""
+        # pylint:disable=protected-access
         if isinstance(frozen, FrozenFeedIterator):
             raise InvalidArgumentException("A mobile checkpoint cannot be applied to web pagination.")
         if not isinstance(frozen, FrozenAnonymousIterator):
             raise InvalidArgumentException("Mismatching resume information.")
+        if self._total_index:
+            raise InvalidArgumentException('thaw() called on already-used iterator.')
+        frozen = _load_frozen_iterator('FrozenAnonymousIterator', _frozen_iterator_data(frozen))
         if str(self._user_id) != frozen.user_id or self._context.username != frozen.context_username:
             raise InvalidArgumentException("Mismatching resume information.")
         if frozen.mode != 'primary' or frozen.primary is None or not isinstance(self._primary, NodeIterator):
             raise InvalidArgumentException("A mobile checkpoint cannot be applied to web pagination.")
-        self._primary.thaw(FrozenNodeIterator(**frozen.primary))
+        if frozen.fallback is not None:
+            raise InvalidArgumentException('A mobile checkpoint cannot be applied to web pagination.')
+        try:
+            first_item = Post(self._context, frozen.first_node) if frozen.first_node is not None else None
+            if first_item is not None:
+                _ = first_item.date_local  # Validate locally before either iterator is changed.
+        except (AssertionError, KeyError, TypeError, ValueError, OverflowError, OSError) as exc:
+            raise InvalidArgumentException('Invalid anonymous resume first_node.') from exc
+        primary = _load_frozen_iterator('FrozenNodeIterator', frozen.primary)
+        current = self._primary.freeze()
+        legacy_variables = _profile_posts_query_variables(current.query_variables.get('username', ''))
+        legacy_variables.pop('first')
+        legacy_variables.pop('include_multi_captions')
+        legacy_variables['data'].pop('include_reel_media_seen_timestamp')
+        legacy_variables['__relay_internal__pv__PolarisMultiCaptionCarouselEnabledrelayprovider'] = False
+        same_scope = (primary.query_hash is None and primary.query_variables == legacy_variables
+                      and primary.query_referer == current.query_referer and primary.context_username is None)
+        if primary.doc_id == '38154989454116081' and current.doc_id == _PROFILE_POSTS_DOC_ID and same_scope:
+            extensions = dict(primary.extra_fields or {})
+            extensions.setdefault('migrated_from_query', {'doc_id': primary.doc_id,
+                                                         'query_variables': primary.query_variables})
+            primary = primary._replace(doc_id=current.doc_id, query_variables=current.query_variables,
+                                       extra_fields=extensions)
+            self._context.log('Migrating saved anonymous web timeline query; retaining its cursor and profile ID.')
+        self._primary.thaw(primary)
         self._total_index = frozen.total_index
         self._best_before = frozen.best_before
-        if frozen.first_node is not None:
-            self._first_item = Post(self._context, frozen.first_node)
+        self._extra_fields = frozen.extra_fields
+        self._seen_mediaids = set(frozen.seen_mediaids)
+        self._first_item = first_item
 
 
 class Profile:
@@ -1124,10 +1238,11 @@ class Profile:
         :raises: :class:`ProfileNotExistsException`
         """
         node, web_posts_first_page, is_id_only = cls._resolve_node(context, username, profile_id)
+        cls._validate_identity(node, username, profile_id)
         profile = cls(context, node)
         profile._web_posts_first_page = web_posts_first_page
         profile._is_id_only = is_id_only
-        profile._has_full_metadata = is_id_only or web_posts_first_page is None or not context.is_logged_in
+        profile._has_full_metadata = not context.is_logged_in
         return profile
 
     def _obtain_metadata_graphql(self):
@@ -1140,16 +1255,15 @@ class Profile:
             "__relay_internal__pv__PolarisCASB976ProfileEnabledrelayprovider": False,
             "__relay_internal__pv__PolarisRepostsConsumptionEnabledrelayprovider": False,
             "__relay_internal__pv__PolarisWebSchoolsEnabledrelayprovider": False,
-            "__relay_internal__pv__PolarisShortDramaEnabledrelayprovider": False,
-            "__relay_internal__pv__PolarisLongformEnabledrelayprovider": False,
             "enable_integrity_filters": True,
         }
-        data = self._context.doc_id_graphql_query('38611279431804694', variables)
+        data = self._context.doc_id_graphql_query('27937681195819736', variables)
         if data is None:
             raise QueryReturnedNotFoundException('GraphQL query returned None')
         user_data = (data.get('data') or {}).get('user')
         if user_data is None:
             raise ProfileNotExistsException('Profile {} does not exist.'.format(self.username))
+        self._validate_identity(user_data, self.username, self.userid)
         self._node = self._normalize_profile_data(user_data)
         self._has_full_metadata = True
 
@@ -1173,7 +1287,7 @@ class Profile:
         except QueryReturnedNotFoundException:
             user = None
         if user and user.get('username'):
-            profile = cls.from_username(context, user['username'])
+            profile = cls.from_username(context, user['username'], profile_id=profile_id)
         else:
             raise ProfileNotExistsException("No profile found, the user may have blocked you (ID: " +
                                             str(profile_id) + ").")
@@ -1219,6 +1333,41 @@ class Profile:
         return Profile._normalize_profile_data(node), feed
 
     @classmethod
+    def _page_profile_node(cls, context: InstaloaderContext, username: str,
+                           profile_id: Optional[int]) -> Optional[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]]:
+        """Resolve identity from the profile page, independently of its post owners."""
+        user: Dict[str, Any] = {}
+        for data in context.get_page_data('{}/'.format(username.lower())):
+            fragment = data.get('xig_user_by_username')
+            if not isinstance(fragment, dict):
+                continue
+            if user.get('pk') and fragment.get('pk') and str(user['pk']) != str(fragment['pk']):
+                raise ProfileIdentityMismatchException('Public profile page contains conflicting account IDs.')
+            user.update(fragment)
+        if not user.get('pk') or not user.get('username'):
+            return None
+        node = dict(user, id=user['pk'])  # HTML's scoped "id" is not the account ID.
+        cls._validate_identity(node, username, profile_id)
+        timeline = node.pop('polaris_ordered_timeline_connection', None)
+        if timeline is not None and not isinstance(timeline, dict):
+            raise BadResponseException('Public profile page has malformed timeline data.')
+        return (node if context.is_logged_in else cls._normalize_profile_data(node)), timeline
+
+    @staticmethod
+    def _validate_identity(node: Dict[str, Any], username: str, profile_id: Optional[int] = None) -> None:
+        """Fence stored numeric IDs; a post owner cannot establish a profile rename."""
+        returned_id = node.get('id') or node.get('pk')
+        if not str(returned_id).isdigit() or not node.get('username'):
+            raise BadResponseException('Profile response has incomplete identity data.')
+        if profile_id is not None:
+            if str(returned_id) != str(profile_id):
+                raise ProfileIdentityMismatchException('Profile {} returned ID {}, expected {}.'
+                                                       .format(username, returned_id, profile_id))
+        elif str(node['username']).casefold() != username.casefold():
+            raise ProfileIdentityMismatchException('Response identity does not match requested profile {}.'
+                                                   .format(username))
+
+    @classmethod
     def _web_timeline_node(cls, context: InstaloaderContext,
                            username: str) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
         """Resolve a public profile from the first page of the web timeline query."""
@@ -1244,6 +1393,7 @@ class Profile:
         if not isinstance(user, dict) or not user.get("pk") or not user.get("username"):
             return None
         node = cls._normalize_profile_data(user)
+        cls._validate_identity(node, username)
         node.setdefault("edge_owner_to_timeline_media", {"count": None})
         return node, timeline
 
@@ -1253,6 +1403,10 @@ class Profile:
                       profile_id: Optional[int] = None
                       ) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]], bool]:
         """Resolve a profile without using native endpoints for anonymous requests."""
+        # pylint:disable=too-many-return-statements
+        page_node = cls._page_profile_node(context, username, profile_id)
+        if page_node is not None:
+            return page_node[0], page_node[1], False
         try:
             data = context.get_json(
                 "api/v1/users/web_profile_info/", params={"username": username.lower()},
@@ -1260,6 +1414,8 @@ class Profile:
             ).get("data")
         except QueryReturnedNotFoundException:
             data = None
+        except TooManyRequestsException:
+            raise
         except (QueryReturnedBadRequestException, QueryReturnedUnauthorizedException, ConnectionException) as err:
             if profile_id is not None and not context.is_logged_in:
                 context.log("Web profile lookup failed; using stored profile ID {} for web posts."
@@ -1269,7 +1425,7 @@ class Profile:
                 timeline_node = cls._web_timeline_node(context, username)
                 if timeline_node is not None:
                     return timeline_node[0], timeline_node[1], False
-                raise ProfileNotExistsException(
+                raise BadResponseException(
                     "Profile {} could not be resolved through anonymous web endpoints."
                     .format(username)
                 ) from err
@@ -1293,7 +1449,7 @@ class Profile:
             timeline_node = cls._web_timeline_node(context, username)
             if timeline_node is not None:
                 return timeline_node[0], timeline_node[1], False
-            raise ProfileNotExistsException(
+            raise BadResponseException(
                 "Profile {} could not be resolved through anonymous web endpoints."
                 .format(username)
             )
@@ -1340,9 +1496,9 @@ class Profile:
         try:
             if not self._has_full_metadata:
                 if not self._context.is_logged_in:
-                    self._node, self._web_posts_first_page, self._is_id_only = self._resolve_node(
-                        self._context, self.username
-                    )
+                    node, first_page, id_only = self._resolve_node(self._context, self.username, self.userid)
+                    self._validate_identity(node, self.username, self.userid)
+                    self._node, self._web_posts_first_page, self._is_id_only = node, first_page, id_only
                     self._has_full_metadata = True
                     return
                 self._obtain_metadata_graphql()
@@ -1367,6 +1523,8 @@ class Profile:
             normalized['id'] = normalized['pk']
         if 'edge_owner_to_timeline_media' not in normalized and 'media_count' in normalized:
             normalized['edge_owner_to_timeline_media'] = {'count': normalized['media_count']}
+        if 'edge_owner_to_timeline_media' not in normalized and 'all_media_count' in normalized:
+            normalized['edge_owner_to_timeline_media'] = {'count': normalized['all_media_count']}
         if 'edge_felix_video_timeline' not in normalized:
             normalized['edge_felix_video_timeline'] = {'count': 0}
         if 'edge_followed_by' not in normalized and 'follower_count' in normalized:
@@ -1616,7 +1774,9 @@ class Profile:
             edge_extractor=(
                 lambda d: d["data"]["xdt_api__v1__feed__user_timeline_graphql_connection"]
             ),
-            node_wrapper=lambda n: Post.from_iphone_struct(self._context, n),
+            node_wrapper=lambda n: (Post.from_shortcode(self._context, n['code'])
+                                    if n.get('__typename', '').startswith('XIGPolaris') and 'taken_at' not in n
+                                    else Post.from_iphone_struct(self._context, n)),
             query_variables=_profile_posts_query_variables(self.username),
             query_referer="https://www.instagram.com/{0}/".format(self.username),
             is_first=Profile._make_is_newest_checker(),
@@ -2575,7 +2735,9 @@ def get_json_structure(structure: JsonExportable) -> dict:
     .. versionadded:: 4.8
     """
     return {
-        'node': structure._asdict(),
+        'node': (_frozen_iterator_data(structure)
+                 if isinstance(structure, (FrozenNodeIterator, FrozenFeedIterator, FrozenAnonymousIterator))
+                 else structure._asdict()),
         'instaloader': {'version': __version__, 'node_type': structure.__class__.__name__}
     }
 
@@ -2600,16 +2762,34 @@ def save_structure_to_file(structure: JsonExportable, filename: str) -> None:
             json.dump(json_structure, fp=fp, indent=4, sort_keys=True)
 
 
-def load_structure(context: InstaloaderContext, json_structure: dict) -> JsonExportable:
+def load_structure(context: InstaloaderContext, json_structure: dict, *, frozen_only: bool = False) -> JsonExportable:
     """Loads a :class:`Post`, :class:`Profile`, :class:`StoryItem`, :class:`Hashtag` or :class:`FrozenNodeIterator` from
     a json structure.
 
     :param context: :attr:`Instaloader.context` linked to the new object, used for additional queries if necessary.
     :param json_structure: Instaloader JSON structure
+    :param frozen_only: Restrict loading to iterator checkpoints; never resolve legacy Post references.
 
     .. versionadded:: 4.8
     """
-    if 'node' in json_structure and 'instaloader' in json_structure and \
+    # pylint:disable=too-many-return-statements
+    if not isinstance(json_structure, dict):
+        raise InvalidArgumentException('Passed json structure is not an Instaloader JSON object.')
+    metadata = json_structure.get('instaloader')
+    if frozen_only and isinstance(metadata, dict):
+        if metadata.get('node_type') not in ('FrozenNodeIterator', 'FrozenFeedIterator', 'FrozenAnonymousIterator'):
+            raise InvalidArgumentException('Resume file must contain a frozen iterator.')
+    # Older callers saved just _asdict(), without the Instaloader envelope.
+    if 'total_index' in json_structure and 'best_before' in json_structure:
+        if 'mode' in json_structure and 'user_id' in json_structure:
+            return _load_frozen_iterator('FrozenAnonymousIterator', json_structure)
+        if 'page_index' in json_structure and 'user_id' in json_structure:
+            return _load_frozen_iterator('FrozenFeedIterator', json_structure)
+        if 'query_variables' in json_structure:
+            return _load_frozen_iterator('FrozenNodeIterator', json_structure)
+    if frozen_only and not isinstance(metadata, dict):
+        raise InvalidArgumentException('Resume file must contain a frozen iterator.')
+    if 'node' in json_structure and isinstance(json_structure.get('instaloader'), dict) and \
             'node_type' in json_structure['instaloader']:
         node_type = json_structure['instaloader']['node_type']
         if node_type == "Post":
@@ -2620,21 +2800,16 @@ def load_structure(context: InstaloaderContext, json_structure: dict) -> JsonExp
             return StoryItem(context, json_structure['node'])
         elif node_type == "Hashtag":
             return Hashtag(context, json_structure['node'])
-        elif node_type == "FrozenNodeIterator":
-            if not 'first_node' in json_structure['node']:
-                json_structure['node']['first_node'] = None
-            return FrozenNodeIterator(**json_structure['node'])
-        elif node_type == "FrozenFeedIterator":
-            return FrozenFeedIterator(**json_structure['node'])
-        elif node_type == "FrozenAnonymousIterator":
-            return FrozenAnonymousIterator(**json_structure['node'])
+        elif node_type in ("FrozenNodeIterator", "FrozenFeedIterator", "FrozenAnonymousIterator"):
+            return _load_frozen_iterator(node_type, json_structure['node'])
     elif 'shortcode' in json_structure:
         # Post JSON created with Instaloader v3
         return Post.from_shortcode(context, json_structure['shortcode'])
     raise InvalidArgumentException("Passed json structure is not an Instaloader JSON")
 
 
-def load_structure_from_file(context: InstaloaderContext, filename: str) -> JsonExportable:
+def load_structure_from_file(context: InstaloaderContext, filename: str, *,
+                             frozen_only: bool = False) -> JsonExportable:
     """Loads a :class:`Post`, :class:`Profile`, :class:`StoryItem`, :class:`Hashtag` or :class:`FrozenNodeIterator` from
     a '.json' or '.json.xz' file that has been saved by :func:`save_structure_to_file`.
 
@@ -2649,4 +2824,4 @@ def load_structure_from_file(context: InstaloaderContext, filename: str) -> Json
         fp = open(filename, 'rt')
     json_structure = json.load(fp)
     fp.close()
-    return load_structure(context, json_structure)
+    return load_structure(context, json_structure, frozen_only=frozen_only)

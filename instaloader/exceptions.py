@@ -53,6 +53,10 @@ class BadResponseException(InstaloaderException):
     pass
 
 
+class ProfileIdentityMismatchException(BadResponseException):
+    """A response does not identify the requested or previously stored profile."""
+
+
 class BadCredentialsException(LoginException):
     pass
 

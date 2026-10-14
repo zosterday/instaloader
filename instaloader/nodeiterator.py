@@ -1,7 +1,9 @@
 import base64
 import hashlib
 import json
+import math
 import os
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from lzma import LZMAError
@@ -20,6 +22,7 @@ class FrozenNodeIterator(NamedTuple):
     remaining_data: Optional[Dict]
     first_node: Optional[Dict]
     doc_id: Optional[str]
+    extra_fields: Optional[Dict[str, Any]] = None
 FrozenNodeIterator.query_hash.__doc__ = """The GraphQL ``query_hash`` parameter."""
 FrozenNodeIterator.query_variables.__doc__ = """The GraphQL ``query_variables`` parameter."""
 FrozenNodeIterator.query_referer.__doc__ = """The HTTP referer used for the GraphQL query."""
@@ -32,6 +35,55 @@ FrozenNodeIterator.first_node.__doc__ = """Node data of the first item, if an it
 FrozenNodeIterator.doc_id.__doc__ = """The GraphQL ``doc_id`` parameter."""
 
 T = TypeVar('T')
+
+
+def _frozen_iterator_data(frozen: Any) -> Dict[str, Any]:
+    """Serialize extensions without changing the existing on-disk field layout."""
+    data = frozen._asdict()
+    extensions = data.pop('extra_fields', None) or {}
+    return {**extensions, **data}
+
+
+def _validate_frozen_common(frozen: Any) -> None:
+    """Check shared state before any iterator is mutated."""
+    if (not isinstance(frozen.total_index, int) or isinstance(frozen.total_index, bool)
+            or frozen.total_index < 0):
+        raise InvalidArgumentException('Invalid resume total_index.')
+    if (not isinstance(frozen.best_before, (int, float)) or isinstance(frozen.best_before, bool)
+            or not math.isfinite(frozen.best_before)
+            or frozen.best_before <= 0):
+        raise InvalidArgumentException('Invalid resume best_before.')
+    try:
+        datetime.fromtimestamp(frozen.best_before)
+    except (ValueError, OverflowError, OSError) as exc:
+        raise InvalidArgumentException('Invalid resume best_before.') from exc
+    if frozen.context_username is not None and not isinstance(frozen.context_username, str):
+        raise InvalidArgumentException('Invalid resume context_username.')
+    if frozen.first_node is not None and not isinstance(frozen.first_node, dict):
+        raise InvalidArgumentException('Invalid resume first_node.')
+
+
+def _validate_frozen_node(frozen: FrozenNodeIterator) -> None:
+    """Reject malformed counters and pagination before changing a live iterator."""
+    _validate_frozen_common(frozen)
+    if not isinstance(frozen.query_variables, dict):
+        raise InvalidArgumentException('Invalid resume query_variables.')
+    for value in (frozen.query_hash, frozen.doc_id, frozen.query_referer, frozen.context_username):
+        if value is not None and not isinstance(value, str):
+            raise InvalidArgumentException('Invalid resume query identity.')
+    if not frozen.query_hash and not frozen.doc_id:
+        raise InvalidArgumentException('Resume query identity missing.')
+    data = frozen.remaining_data
+    if not isinstance(data, dict) or not isinstance(data.get('edges'), list):
+        raise InvalidArgumentException('Invalid resume remaining_data.')
+    if any(not isinstance(edge, dict) or not isinstance(edge.get('node'), dict) for edge in data['edges']):
+        raise InvalidArgumentException('Invalid resume edges.')
+    page_info = data.get('page_info')
+    if not isinstance(page_info, dict) or not isinstance(page_info.get('has_next_page'), bool):
+        raise InvalidArgumentException('Invalid resume page_info.')
+    if ((page_info.get('end_cursor') is not None and not isinstance(page_info['end_cursor'], str))
+            or (page_info['has_next_page'] and not page_info.get('end_cursor'))):
+        raise InvalidArgumentException('Invalid resume page_info or cursor.')
 
 
 class NodeIterator(Iterator[T]):
@@ -99,7 +151,9 @@ class NodeIterator(Iterator[T]):
         else:
             self._data = self._query()
         self._first_node: Optional[Dict] = None
+        self._first_item_cache: Optional[T] = None
         self._is_first = is_first
+        self._extra_fields: Optional[Dict[str, Any]] = None
 
     def _query(self, after: Optional[str] = None) -> Dict:
         if self._doc_id is not None:
@@ -152,9 +206,11 @@ class NodeIterator(Iterator[T]):
             if self._is_first is not None:
                 if self._is_first(item, self.first_item):
                     self._first_node = node
+                    self._first_item_cache = item
             else:
                 if self._first_node is None:
                     self._first_node = node
+                    self._first_item_cache = item
             return item
         if self._data.get('page_info', {}).get('has_next_page'):
             query_response = self._query(self._data['page_info']['end_cursor'])
@@ -201,7 +257,9 @@ class NodeIterator(Iterator[T]):
         .. versionchanged:: 4.9.2
            What is considered the first item can be overridden.
         """
-        return self._node_wrapper(self._first_node) if self._first_node is not None else None
+        if self._first_node is not None and self._first_item_cache is None:
+            self._first_item_cache = self._node_wrapper(self._first_node)
+        return self._first_item_cache
 
     @staticmethod
     def page_length() -> int:
@@ -223,6 +281,7 @@ class NodeIterator(Iterator[T]):
             remaining_data=remaining_data,
             first_node=self._first_node,
             doc_id=self._doc_id,
+            extra_fields=self._extra_fields,
         )
 
     def thaw(self, frozen: FrozenNodeIterator) -> None:
@@ -237,6 +296,7 @@ class NodeIterator(Iterator[T]):
         """
         if self._total_index or self._page_index:
             raise InvalidArgumentException("thaw() called on already-used iterator.")
+        _validate_frozen_node(frozen)
         if (self._query_hash != frozen.query_hash or
                 self._query_variables != frozen.query_variables or
                 self._query_referer != frozen.query_referer or
@@ -247,11 +307,14 @@ class NodeIterator(Iterator[T]):
             raise InvalidArgumentException("\"best before\" date missing.")
         if frozen.remaining_data is None:
             raise InvalidArgumentException("\"remaining_data\" missing.")
+        best_before = datetime.fromtimestamp(frozen.best_before)
         self._total_index = frozen.total_index
-        self._best_before = datetime.fromtimestamp(frozen.best_before)
+        self._best_before = best_before
         self._data = frozen.remaining_data
+        self._extra_fields = frozen.extra_fields
         if frozen.first_node is not None:
             self._first_node = frozen.first_node
+            self._first_item_cache = None
 
 
 @contextmanager
@@ -315,8 +378,21 @@ def resumable_iteration(context: InstaloaderContext,
             start_index = iterator.total_index  # type: ignore[attr-defined]
             context.log("Resuming from {}.".format(resume_file_path))
         except (InvalidArgumentException, LZMAError, json.decoder.JSONDecodeError, EOFError,
-                AttributeError, KeyError, TypeError) as exc:
-            context.error("Warning: Not resuming from {}: {}".format(resume_file_path, exc))
+                AttributeError, KeyError, TypeError, ValueError, OverflowError) as exc:
+            # Preserve the exact input before a new checkpoint or completion can replace it.
+            descriptor, quarantine = tempfile.mkstemp(
+                prefix=os.path.basename(resume_file_path) + '.quarantine-',
+                dir=os.path.dirname(resume_file_path) or '.')
+            os.close(descriptor)
+            diagnostic = {'original_path': resume_file_path, 'quarantine_path': quarantine,
+                          'reason': str(exc), 'error_type': type(exc).__name__,
+                          'created_at': datetime.now().astimezone().isoformat()}
+            with open(quarantine + '.diagnostic.json', 'x', encoding='utf-8') as output:
+                json.dump(diagnostic, output, indent=2)
+            os.replace(resume_file_path, quarantine)
+            resume_file_exists = False
+            context.error("Warning: Not resuming from {}: {}. Preserved at {}; starting a fresh iteration."
+                          .format(resume_file_path, exc, quarantine))
     try:
         yield is_resuming, start_index
     except (Exception, KeyboardInterrupt):

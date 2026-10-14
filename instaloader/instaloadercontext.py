@@ -10,7 +10,9 @@ import urllib.parse
 import uuid
 from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from functools import partial
+from html.parser import HTMLParser
 from typing import Any, Callable, Dict, Iterator, List, Optional, Union
 
 import requests
@@ -28,6 +30,48 @@ def copy_session(session: requests.Session, request_timeout: Optional[float] = N
     # Need to silence mypy bug for this. See: https://github.com/python/mypy/issues/2427
     new.request = partial(new.request, timeout=request_timeout)  # type: ignore
     return new
+
+
+def _embedded_query_data(obj: Any) -> Iterator[Dict[str, Any]]:
+    """Yield GraphQL result data embedded in a public page's JSON."""
+    if isinstance(obj, dict):
+        result = obj['__bbox'].get('result') if isinstance(obj.get('__bbox'), dict) else None
+        if isinstance(result, dict) and isinstance(result.get('data'), dict):
+            yield result['data']
+        for value in obj.values():
+            yield from _embedded_query_data(value)
+    elif isinstance(obj, list):
+        for value in obj:
+            yield from _embedded_query_data(value)
+
+
+class _JSONScriptParser(HTMLParser):
+    """Read JSON scripts regardless of attribute order or quoting."""
+
+    def __init__(self):
+        super().__init__()
+        self.data: List[Dict[str, Any]] = []
+        self._chunks: Optional[List[str]] = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'script' and (dict(attrs).get('type') or '').strip().lower() == 'application/json':
+            self._chunks = []
+
+    def handle_data(self, data):
+        if self._chunks is not None:
+            self._chunks.append(data)
+
+    def handle_endtag(self, tag):
+        if tag == 'script' and self._chunks is not None:
+            with suppress(ValueError):
+                self.data.extend(_embedded_query_data(json.loads(''.join(self._chunks))))
+            self._chunks = None
+
+
+def _safe_url(url: str) -> str:
+    """Keep query strings, fragments and embedded credentials out of diagnostics."""
+    parts = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit((parts.scheme, parts.netloc.rsplit('@', 1)[-1], parts.path, '', ''))
 
 
 def default_user_agent() -> str:
@@ -372,9 +416,9 @@ class InstaloaderContext:
     @staticmethod
     def _response_error(resp: requests.Response) -> str:
         extra_from_json: Optional[str] = None
-        with suppress(json.decoder.JSONDecodeError):
+        with suppress(ValueError):
             resp_json = resp.json()
-            if "status" in resp_json:
+            if isinstance(resp_json, dict) and "status" in resp_json:
                 extra_from_json = (
                     f"\"{resp_json['status']}\" status, message \"{resp_json['message']}\""
                     if "message" in resp_json
@@ -383,8 +427,38 @@ class InstaloaderContext:
         return (
             f"{resp.status_code} {resp.reason}"
             f"{f' - {extra_from_json}' if extra_from_json is not None else ''}"
-            f" when accessing {resp.url}"
+            f" when accessing {_safe_url(resp.url)}"
         )
+
+    @staticmethod
+    def _http_error(exception_type, resp: requests.Response):
+        """Keep HTTP status and cooldown available to callers without retaining request credentials."""
+        err = exception_type(InstaloaderContext._response_error(resp))
+        err.status_code = resp.status_code
+        err.retry_after = None
+        retry_after = resp.headers.get('Retry-After')
+        if retry_after:
+            with suppress(ValueError, TypeError, OverflowError):
+                if retry_after.strip().isdigit():
+                    err.retry_after = float(retry_after)
+                else:
+                    err.retry_after = max(0.0, parsedate_to_datetime(retry_after).timestamp() - time.time())
+        return err
+
+    def _check_redirect(self, resp: requests.Response) -> str:
+        """Stop at login or challenge redirects before making another request."""
+        redirect_url = urllib.parse.urljoin(resp.url, resp.headers.get('location', ''))
+        redirect_path = urllib.parse.urlsplit(redirect_url).path.rstrip('/')
+        if redirect_path.startswith('/accounts/login'):
+            if not self.is_logged_in:
+                raise self._http_error(LoginRequiredException, resp)
+            raise self._http_error(AbortDownloadException, resp)
+        if redirect_path.startswith(('/challenge', '/checkpoint', '/accounts/suspended')):
+            err = self._http_error(AbortDownloadException, resp)
+            err.block_reason = 'challenge_required'
+            err.args = ('Instagram requires a challenge or checkpoint before this request can continue.',)
+            raise err
+        return redirect_url
 
     def get_json(self, path: str, params: Dict[str, Any], host: str = 'www.instagram.com',
                  session: Optional[requests.Session] = None, _attempt=1,
@@ -403,6 +477,7 @@ class InstaloaderContext:
         :raises QueryReturnedBadRequestException: When the server responds with a 400 (and not
             'feedback_required'/'checkpoint_required'/'challenge_required').
         :raises QueryReturnedUnauthorizedException: When the server responds with a 401.
+        :raises QueryReturnedForbiddenException: When the server responds with a 403.
         :raises QueryReturnedNotFoundException: When the server responds with a 404.
         :raises ConnectionException: When query repeatedly failed.
 
@@ -429,72 +504,76 @@ class InstaloaderContext:
             else:
                 resp = sess.get('https://{0}/{1}'.format(host, path), params=params, allow_redirects=False)
             if resp.status_code in self.fatal_status_codes:
-                redirect = " redirect to {}".format(resp.headers['location']) if 'location' in resp.headers else ""
-                body = ""
-                if resp.headers['Content-Type'].startswith('application/json'):
-                    body = ': ' + resp.text[:500] + ('…' if len(resp.text) > 501 else '')
-                raise AbortDownloadException("Query to https://{}/{} responded with \"{} {}\"{}{}".format(
-                    host, path, resp.status_code, resp.reason, redirect, body
-                ))
+                raise self._http_error(AbortDownloadException, resp)
+            redirects = 0
             while resp.is_redirect:
-                redirect_url = resp.headers['location']
-                self.log('\nHTTP redirect from https://{0}/{1} to {2}'.format(host, path, redirect_url))
-                if (redirect_url.startswith('https://www.instagram.com/accounts/login') or
-                    redirect_url.startswith('https://i.instagram.com/accounts/login')):
-                    if not self.is_logged_in:
-                        raise LoginRequiredException("Redirected to login page. Use --login or --load-cookies.")
-                    raise AbortDownloadException("Redirected to login page. You've been logged out, please wait " +
-                                                 "some time, recreate the session and try again")
-                if redirect_url.startswith('https://{}/'.format(host)):
-                    resp = sess.get(redirect_url if redirect_url.endswith('/') else redirect_url + '/',
-                                    params=params, allow_redirects=False)
-                else:
-                    break
+                redirect_url = self._check_redirect(resp)
+                self.log('\nHTTP redirect to {}'.format(_safe_url(redirect_url)))
+                redirects += 1
+                if redirects > 5 or urllib.parse.urlsplit(redirect_url).netloc != host:
+                    raise self._http_error(BadResponseException, resp)
+                resp = sess.get(redirect_url, params=params, allow_redirects=False)
             if response_headers is not None:
                 response_headers.clear()
                 response_headers.update(resp.headers)
             if resp.status_code == 400:
-                with suppress(json.decoder.JSONDecodeError):
-                    if resp.json().get("message") in [
+                with suppress(ValueError):
+                    body = resp.json()
+                    if isinstance(body, dict) and body.get("message") in [
                         "feedback_required",
                         "checkpoint_required",
                         "challenge_required",
                     ]:
                         # Raise AbortDownloadException in case of substantial Instagram
                         # requirements to stop producing more requests
-                        raise AbortDownloadException(self._response_error(resp))
-                raise QueryReturnedBadRequestException(self._response_error(resp))
+                        raise self._http_error(AbortDownloadException, resp)
+                raise self._http_error(QueryReturnedBadRequestException, resp)
             if resp.status_code == 401:
                 message = None
-                with suppress(json.decoder.JSONDecodeError):
-                    message = resp.json().get('message')
+                with suppress(ValueError):
+                    body = resp.json()
+                    message = body.get('message') if isinstance(body, dict) else None
                 if (not self.is_logged_in and is_iphone_query and isinstance(message, str) and
                         message.lower().startswith('please wait')):
                     # Instagram sometimes reports anonymous throttling as 401
                     # instead of 429. Route only that response through the normal
                     # rate controller so retries happen after a real cooldown.
-                    raise TooManyRequestsException(self._response_error(resp))
-                raise QueryReturnedUnauthorizedException(self._response_error(resp))
+                    raise self._http_error(TooManyRequestsException, resp)
+                raise self._http_error(QueryReturnedUnauthorizedException, resp)
+            if resp.status_code == 403:
+                raise self._http_error(QueryReturnedForbiddenException, resp)
             if resp.status_code == 404:
-                raise QueryReturnedNotFoundException(self._response_error(resp))
+                raise self._http_error(QueryReturnedNotFoundException, resp)
             if resp.status_code == 429:
-                raise TooManyRequestsException(self._response_error(resp))
+                raise self._http_error(TooManyRequestsException, resp)
             if resp.status_code != 200:
-                raise ConnectionException(self._response_error(resp))
-            else:
+                raise self._http_error(ConnectionException, resp)
+            try:
                 resp_json = resp.json()
+            except ValueError as err:
+                raise BadResponseException("Expected JSON object from {}, received invalid JSON."
+                                           .format(_safe_url(resp.url))) from err
+            if not isinstance(resp_json, dict):
+                raise BadResponseException("Expected JSON object from {}, received {}."
+                                           .format(_safe_url(resp.url), type(resp_json).__name__))
+            if resp_json.get('message') in ('feedback_required', 'checkpoint_required', 'challenge_required'):
+                raise self._http_error(AbortDownloadException, resp)
+            if resp_json.get('message') == 'login_required' or resp_json.get('require_login'):
+                raise self._http_error(LoginRequiredException, resp)
             if 'status' in resp_json and resp_json['status'] != "ok":
-                raise ConnectionException(self._response_error(resp))
+                raise self._http_error(BadResponseException, resp)
             return resp_json
-        except (ConnectionException, json.decoder.JSONDecodeError, requests.exceptions.RequestException) as err:
-            error_string = "JSON Query to {}: {}".format(path, err)
-            if _attempt == self.max_connection_attempts:
-                if isinstance(err, QueryReturnedNotFoundException):
-                    raise QueryReturnedNotFoundException(error_string) from err
-                if isinstance(err, TooManyRequestsException):
-                    raise TooManyRequestsException(error_string) from err
-                else:
-                    raise ConnectionException(error_string) from err
+        except QueryReturnedNotFoundException:
+            raise
+        except (ConnectionException, requests.exceptions.RequestException) as err:
+            detail = type(err).__name__ if isinstance(err, requests.exceptions.RequestException) else str(err)
+            error_string = "JSON Query to {}: {}".format(_safe_url(path), detail)
+            attempt_limit = self.max_connection_attempts or (3 if isinstance(err, TooManyRequestsException) else 0)
+            if attempt_limit and _attempt >= attempt_limit:
+                if isinstance(err, ConnectionException):
+                    err.args = (error_string,)
+                    raise
+                raise ConnectionException(error_string) from err
             self.error(error_string + " [retrying; skip with ^C]", repeat_at_end=False)
             try:
                 if isinstance(err, TooManyRequestsException):
@@ -506,6 +585,8 @@ class InstaloaderContext:
                         self._rate_controller.handle_429('iphone')
                     if is_other_query:
                         self._rate_controller.handle_429('other')
+                    if getattr(err, 'retry_after', None) is not None:
+                        self._rate_controller.sleep(getattr(err, 'retry_after'))
                 return self.get_json(path=path, params=params, host=host, session=sess, _attempt=_attempt + 1,
                                      response_headers=response_headers, use_post=use_post)
             except KeyboardInterrupt:
@@ -686,6 +767,39 @@ class InstaloaderContext:
                     self.iphone_headers[key.replace('x-ig-set-', 'x-ig-')] = value
 
             return response
+
+    def get_page_data(self, path: str) -> List[Dict[str, Any]]:
+        """Return GraphQL data embedded in a public page, using a fresh anonymous session.
+
+        Missing embedded data returns an empty list. Authentication and rate restrictions
+        are terminal; callers must not interpret them as evidence that a profile is absent.
+        """
+        self.do_sleep()
+        self._rate_controller.wait_before_query('other')
+        url = 'https://www.instagram.com/{0}'.format(path)
+        headers = {'Accept': 'text/html', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate',
+                   'Sec-Fetch-Site': 'none'}
+        try:
+            with self.get_anonymous_session() as anonymous_session:
+                resp = anonymous_session.get(url, headers=headers, allow_redirects=False)
+        except requests.exceptions.RequestException as err:
+            raise ConnectionException("Page request to {} failed ({})."
+                                      .format(_safe_url(url), type(err).__name__)) from err
+        if resp.status_code in self.fatal_status_codes:
+            raise self._http_error(AbortDownloadException, resp)
+        if resp.is_redirect:
+            self._check_redirect(resp)
+            raise self._http_error(BadResponseException, resp)
+        error_type = {401: QueryReturnedUnauthorizedException, 403: QueryReturnedForbiddenException,
+                      404: QueryReturnedNotFoundException, 429: TooManyRequestsException}.get(resp.status_code)
+        if error_type is not None:
+            raise self._http_error(error_type, resp)
+        if resp.status_code != 200:
+            raise self._http_error(ConnectionException, resp)
+        parser = _JSONScriptParser()
+        parser.feed(resp.text)
+        parser.close()
+        return parser.data
 
     def write_raw(self, resp: Union[bytes, requests.Response], filename: str) -> None:
         """Write raw response data into a file.

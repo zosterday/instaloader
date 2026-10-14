@@ -91,7 +91,7 @@ def timeline_response(username="business_profile", items=None, has_next_page=Fal
 class TestProfileResolution(unittest.TestCase):
 
     def test_anonymous_resolution_prefers_web_profile_info(self):
-        context = Mock(is_logged_in=False, max_connection_attempts=3)
+        context = Mock(is_logged_in=False, max_connection_attempts=3, get_page_data=Mock(return_value=[]))
         context.get_json.return_value = web_profile_response()
 
         profile = Profile.from_username(context, "Web_Profile")
@@ -106,7 +106,7 @@ class TestProfileResolution(unittest.TestCase):
         context.get_iphone_json.assert_not_called()
 
     def test_anonymous_resolution_uses_web_timeline_after_profile_info_401(self):
-        context = Mock(is_logged_in=False, max_connection_attempts=3)
+        context = Mock(is_logged_in=False, max_connection_attempts=3, get_page_data=Mock(return_value=[]))
         context.get_json.side_effect = QueryReturnedUnauthorizedException("web profile info failed")
         context.doc_id_graphql_query.return_value = timeline_response()
 
@@ -117,11 +117,11 @@ class TestProfileResolution(unittest.TestCase):
         self.assertFalse(profile.has_blocked_viewer)
         self.assertIsNone(profile.mediacount)
         context.get_json.assert_called_once()
-        self.assertEqual(context.doc_id_graphql_query.call_args.args[0], "38154989454116081")
+        self.assertEqual(context.doc_id_graphql_query.call_args.args[0], "28975909992013618")
         context.get_iphone_json.assert_not_called()
 
     def test_cached_id_is_used_without_native_profile_resolution(self):
-        context = Mock(is_logged_in=False, max_connection_attempts=3)
+        context = Mock(is_logged_in=False, max_connection_attempts=3, get_page_data=Mock(return_value=[]))
         context.get_json.side_effect = QueryReturnedUnauthorizedException("web profile info failed")
 
         profile = Profile.from_username(context, "Cached_Profile", profile_id=1234)
@@ -132,7 +132,7 @@ class TestProfileResolution(unittest.TestCase):
         context.get_iphone_json.assert_not_called()
 
     def test_cached_id_web_posts_failure_does_not_fall_back_to_mobile(self):
-        context = Mock(is_logged_in=False, max_connection_attempts=3)
+        context = Mock(is_logged_in=False, max_connection_attempts=3, get_page_data=Mock(return_value=[]))
         context.get_json.side_effect = QueryReturnedUnauthorizedException("web profile info failed")
         context.doc_id_graphql_query.side_effect = QueryReturnedUnauthorizedException("web posts failed")
 
@@ -144,7 +144,7 @@ class TestProfileResolution(unittest.TestCase):
         context.get_iphone_json.assert_not_called()
 
     def test_get_posts_uses_current_web_timeline_shape(self):
-        context = Mock(is_logged_in=False, max_connection_attempts=3)
+        context = Mock(is_logged_in=False, max_connection_attempts=3, get_page_data=Mock(return_value=[]))
         context.get_json.return_value = web_profile_response()
         context.doc_id_graphql_query.return_value = timeline_response(username="web_profile")
         profile = Profile.from_username(context, "Web_Profile")
@@ -155,11 +155,11 @@ class TestProfileResolution(unittest.TestCase):
         self.assertEqual(next(posts).shortcode, "web-post")
         with self.assertRaises(StopIteration):
             next(posts)
-        self.assertEqual(context.doc_id_graphql_query.call_args.args[0], "38154989454116081")
+        self.assertEqual(context.doc_id_graphql_query.call_args.args[0], "28975909992013618")
         context.get_iphone_json.assert_not_called()
 
     def test_anonymous_web_timeline_paginates_with_relay_cursor(self):
-        context = Mock(is_logged_in=False, max_connection_attempts=3)
+        context = Mock(is_logged_in=False, max_connection_attempts=3, get_page_data=Mock(return_value=[]))
         context.get_json.return_value = web_profile_response()
         first_node = {"pk": "post-1"}
         second_node = {"pk": "post-2"}
@@ -189,7 +189,7 @@ class TestProfileResolution(unittest.TestCase):
         context.get_iphone_json.assert_not_called()
 
     def test_logged_in_resolution_falls_back_to_feed_after_401(self):
-        context = Mock(is_logged_in=True, max_connection_attempts=3)
+        context = Mock(is_logged_in=True, max_connection_attempts=3, get_page_data=Mock(return_value=[]))
         context.get_json.side_effect = [
             QueryReturnedUnauthorizedException("web profile info failed"),
             feed_response(),
@@ -212,7 +212,7 @@ class TestProfileResolution(unittest.TestCase):
         context.get_iphone_json.assert_not_called()
 
     def test_reraises_401_when_feed_fallback_also_fails(self):
-        context = Mock(is_logged_in=True, max_connection_attempts=3)
+        context = Mock(is_logged_in=True, max_connection_attempts=3, get_page_data=Mock(return_value=[]))
         context.get_json.side_effect = [
             QueryReturnedUnauthorizedException("original failure"),
             QueryReturnedBadRequestException("feed failure"),
@@ -222,7 +222,7 @@ class TestProfileResolution(unittest.TestCase):
             Profile.from_username(context, "empty_profile")
 
     def test_get_posts_reuses_web_timeline_resolution_page(self):
-        context = Mock(is_logged_in=False, max_connection_attempts=3)
+        context = Mock(is_logged_in=False, max_connection_attempts=3, get_page_data=Mock(return_value=[]))
         context.get_json.side_effect = QueryReturnedUnauthorizedException("web profile info failed")
         context.doc_id_graphql_query.return_value = timeline_response()
         profile = Profile.from_username(context, "Business_Profile")
