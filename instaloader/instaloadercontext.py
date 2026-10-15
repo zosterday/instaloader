@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from functools import partial
 from html.parser import HTMLParser
-from typing import Any, Callable, Dict, Iterator, List, Optional, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import requests
 import requests.utils
@@ -45,12 +45,27 @@ def _embedded_query_data(obj: Any) -> Iterator[Dict[str, Any]]:
             yield from _embedded_query_data(value)
 
 
+def _public_bootstrap_modules(obj: Any) -> Iterator[Tuple[str, Dict[str, Any]]]:
+    """Read anonymous request tokens from the page's module definitions."""
+    if isinstance(obj, list):
+        if (len(obj) >= 4 and isinstance(obj[0], str)
+                and obj[0] in ('LSD', 'InstagramSecurityConfig') and obj[1] == []
+                and isinstance(obj[2], dict)):
+            yield obj[0], obj[2]
+        for value in obj:
+            yield from _public_bootstrap_modules(value)
+    elif isinstance(obj, dict):
+        for value in obj.values():
+            yield from _public_bootstrap_modules(value)
+
+
 class _JSONScriptParser(HTMLParser):
     """Read JSON scripts regardless of attribute order or quoting."""
 
     def __init__(self):
         super().__init__()
         self.data: List[Dict[str, Any]] = []
+        self.bootstrap: Dict[str, Dict[str, Any]] = {}
         self._chunks: Optional[List[str]] = None
 
     def handle_starttag(self, tag, attrs):
@@ -64,7 +79,11 @@ class _JSONScriptParser(HTMLParser):
     def handle_endtag(self, tag):
         if tag == 'script' and self._chunks is not None:
             with suppress(ValueError):
-                self.data.extend(_embedded_query_data(json.loads(''.join(self._chunks))))
+                obj = json.loads(''.join(self._chunks))
+                self.data.extend(_embedded_query_data(obj))
+                for name, data in _public_bootstrap_modules(obj):
+                    # Later worker payloads can contain an unrelated LSD definition.
+                    self.bootstrap.setdefault(name, data)
             self._chunks = None
 
 
@@ -131,6 +150,8 @@ class InstaloaderContext:
         self.user_agent = user_agent if user_agent is not None else default_user_agent()
         self.request_timeout = request_timeout
         self._session = self.get_anonymous_session()
+        self._public_session: Optional[requests.Session] = None
+        self._public_page_bootstrap: Dict[str, Dict[str, Dict[str, Any]]] = {}
         self.username = None
         self.user_id = None
         self.sleep = sleep
@@ -207,6 +228,8 @@ class InstaloaderContext:
             for err in self.error_log:
                 print(err, file=sys.stderr)
         self._session.close()
+        if self._public_session is not None:
+            self._public_session.close()
 
     @contextmanager
     def error_catcher(self, extra_info: Optional[str] = None):
@@ -485,7 +508,8 @@ class InstaloaderContext:
            Added `use_post` parameter.
         """
         is_graphql_query = 'query_hash' in params and 'graphql/query' in path
-        is_doc_id_query = 'doc_id' in params and 'graphql/query' in path
+        is_public_graphql = path.rstrip('/') == 'api/graphql'
+        is_doc_id_query = 'doc_id' in params and ('graphql/query' in path or is_public_graphql)
         is_iphone_query = host == 'i.instagram.com'
         is_other_query = not is_graphql_query and not is_doc_id_query and host == "www.instagram.com"
         sess = session if session else self._session
@@ -549,13 +573,25 @@ class InstaloaderContext:
             if resp.status_code != 200:
                 raise self._http_error(ConnectionException, resp)
             try:
-                resp_json = resp.json()
+                if is_public_graphql:
+                    body = resp.text.lstrip()
+                    if body.startswith('for (;;);'):
+                        body = body[len('for (;;);'):]
+                    resp_json = json.loads(body)
+                else:
+                    resp_json = resp.json()
             except ValueError as err:
                 raise BadResponseException("Expected JSON object from {}, received invalid JSON."
                                            .format(_safe_url(resp.url))) from err
             if not isinstance(resp_json, dict):
                 raise BadResponseException("Expected JSON object from {}, received {}."
                                            .format(_safe_url(resp.url), type(resp_json).__name__))
+            if is_public_graphql and (resp_json.get('error') or resp_json.get('errors')):
+                # Do not expose echoed variables, tokens or opaque server debug data.
+                application_error = BadResponseException('Public GraphQL request returned an application error from {}.'
+                                                         .format(_safe_url(resp.url)))
+                setattr(application_error, 'graphql_error_code', resp_json.get('error'))
+                raise application_error
             if resp_json.get('message') in ('feedback_required', 'checkpoint_required', 'challenge_required'):
                 raise self._http_error(AbortDownloadException, resp)
             if resp_json.get('message') == 'login_required' or resp_json.get('require_login'):
@@ -668,6 +704,36 @@ class InstaloaderContext:
             self.error("GraphQL response did not contain a \"status\" field.")
         return resp_json
 
+    def public_graphql_query(self, doc_id: str, variables: Dict[str, Any],
+                             referer: str, query_name: str) -> Dict[str, Any]:
+        """Execute a logged-out WWW query with the public page's anonymous bootstrap."""
+        parts = urllib.parse.urlsplit(referer)
+        if parts.scheme != 'https' or parts.netloc != 'www.instagram.com' or parts.query or parts.fragment:
+            raise InvalidArgumentException('Public GraphQL referer must be an Instagram page URL.')
+        if referer not in self._public_page_bootstrap:
+            self.get_page_data(parts.path.lstrip('/'))
+        bootstrap = self._public_page_bootstrap.get(referer, {})
+        lsd = bootstrap.get('LSD', {}).get('token')
+        if not isinstance(lsd, str) or not lsd or self._public_session is None:
+            raise BadResponseException('Public page did not provide the anonymous GraphQL bootstrap.')
+        csrf = next((cookie.value for cookie in self._public_session.cookies
+                     if cookie.name == 'csrftoken' and cookie.value),
+                    bootstrap.get('InstagramSecurityConfig', {}).get('csrf_token', ''))
+        with copy_session(self._public_session, self.request_timeout) as session:
+            # The legacy copy helper flattens cookie domains; rotations must replace
+            # the original scoped cookie rather than create a second global cookie.
+            session.cookies = self._public_session.cookies.copy()
+            session.headers.update({'Accept': '*/*', 'Origin': 'https://www.instagram.com', 'Referer': referer,
+                                    'Sec-Fetch-Site': 'same-origin', 'Sec-Fetch-Mode': 'cors',
+                                    'Sec-Fetch-Dest': 'empty', 'X-FB-LSD': lsd, 'X-CSRFToken': csrf,
+                                    'X-ASBD-ID': '359341', 'X-FB-Friendly-Name': query_name})
+            response = self.get_json('api/graphql', {'__a': '1', 'lsd': lsd, 'doc_id': doc_id,
+                                     'variables': json.dumps(variables, separators=(',', ':')),
+                                     'server_timestamps': 'true', 'fb_api_caller_class': 'RelayModern',
+                                     'fb_api_req_friendly_name': query_name}, session=session, use_post=True)
+            self._public_session.cookies.update(session.cookies)
+            return response
+
     def graphql_node_list(self, query_hash: str, query_variables: Dict[str, Any],
                           query_referer: Optional[str],
                           edge_extractor: Callable[[Dict[str, Any]], Dict[str, Any]],
@@ -769,7 +835,7 @@ class InstaloaderContext:
             return response
 
     def get_page_data(self, path: str) -> List[Dict[str, Any]]:
-        """Return GraphQL data embedded in a public page, using a fresh anonymous session.
+        """Return embedded GraphQL data using a separate, always-anonymous session.
 
         Missing embedded data returns an empty list. Authentication and rate restrictions
         are terminal; callers must not interpret them as evidence that a profile is absent.
@@ -780,8 +846,10 @@ class InstaloaderContext:
         headers = {'Accept': 'text/html', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate',
                    'Sec-Fetch-Site': 'none'}
         try:
-            with self.get_anonymous_session() as anonymous_session:
-                resp = anonymous_session.get(url, headers=headers, allow_redirects=False)
+            if self._public_session is None:
+                self._public_session = self.get_anonymous_session()
+                self._public_session.cookies.clear()
+            resp = self._public_session.get(url, headers=headers, allow_redirects=False)
         except requests.exceptions.RequestException as err:
             raise ConnectionException("Page request to {} failed ({})."
                                       .format(_safe_url(url), type(err).__name__)) from err
@@ -799,6 +867,8 @@ class InstaloaderContext:
         parser = _JSONScriptParser()
         parser.feed(resp.text)
         parser.close()
+        if parser.bootstrap:
+            self._public_page_bootstrap[url] = parser.bootstrap
         return parser.data
 
     def write_raw(self, resp: Union[bytes, requests.Response], filename: str) -> None:

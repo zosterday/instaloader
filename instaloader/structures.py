@@ -4,7 +4,7 @@ import lzma
 import re
 from base64 import b64decode, b64encode
 from contextlib import suppress
-from datetime import datetime
+from datetime import datetime, timedelta
 from itertools import islice
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, Iterator, List, NamedTuple, Optional, Tuple, Union
@@ -1053,10 +1053,12 @@ def _load_frozen_iterator(node_type: str, state: Dict[str, Any]) -> Any:
 
 
 _PROFILE_POSTS_DOC_ID = "28975909992013618"
+_PUBLIC_PROFILE_POSTS_DOC_ID = "27389614800735091"
+_PUBLIC_PROFILE_POSTS_QUERY = "PolarisLoggedOutDesktopWWWProfilePostsTabContentQuery_connection"
 
 
 def _profile_posts_query_variables(username: str) -> Dict[str, Any]:
-    """Return the variables required by the current public web profile-post query."""
+    """Return variables for the logged-in web profile-post query."""
     return {
         "data": {
             "count": NodeIterator.page_length(),
@@ -1072,6 +1074,40 @@ def _profile_posts_query_variables(username: str) -> Dict[str, Any]:
         "__relay_internal__pv__PolarisShortDramaEnabledrelayprovider": False,
         "__relay_internal__pv__PolarisReelsRecoDebugOverlayEnabledrelayprovider": False,
     }
+
+
+def _public_timeline_data(response: Dict[str, Any], scoped_id: str) -> Dict[str, Any]:
+    """Validate the public connection before replacing any saved iterator state."""
+    data = response.get('data')
+    node = data.get('node') if isinstance(data, dict) else None
+    if not isinstance(node, dict):
+        raise BadResponseException('Public profile pagination did not return a user node.')
+    if node.get('id') != scoped_id:
+        raise ProfileIdentityMismatchException('Public pagination returned a different scoped profile ID.')
+    timeline = node.get('polaris_ordered_timeline_connection')
+    if not isinstance(timeline, dict):
+        raise BadResponseException('Public profile pagination did not return a timeline connection.')
+    try:
+        _validate_frozen_node(FrozenNodeIterator(
+            None, {'id': scoped_id}, None, None, 0, (datetime.now() + timedelta(days=1)).timestamp(),
+            timeline, None, _PUBLIC_PROFILE_POSTS_DOC_ID))
+    except InvalidArgumentException as exc:
+        raise BadResponseException('Public profile pagination returned malformed edges or page information.') from exc
+    return timeline
+
+
+class _PublicProfilePostIterator(NodeIterator['Post']):
+    """Paginate the public ordered connection using its own query and scoped ID."""
+
+    def _query_doc_id(self, doc_id: str, after: Optional[str] = None) -> Dict:
+        assert self._query_referer is not None
+        data = self._edge_extractor(self._context.public_graphql_query(
+            doc_id, {**self._query_variables, 'after': after}, self._query_referer, _PUBLIC_PROFILE_POSTS_QUERY))
+        if after and data['page_info']['has_next_page'] and (
+                data['page_info']['end_cursor'] == after or not data['edges'] or data['edges'] == self._data['edges']):
+            raise BadResponseException('Public profile pagination did not advance its cursor or posts.')
+        self._best_before = datetime.now() + self._shelf_life
+        return data
 
 
 def _anonymous_iterator_magic(context: InstaloaderContext, user_id: Union[int, str]) -> str:
@@ -1176,6 +1212,30 @@ class _AnonymousPostIterator(Iterator['Post']):
             primary = primary._replace(doc_id=current.doc_id, query_variables=current.query_variables,
                                        extra_fields=extensions)
             self._context.log('Migrating saved anonymous web timeline query; retaining its cursor and profile ID.')
+        if current.doc_id == _PUBLIC_PROFILE_POSTS_DOC_ID and primary.doc_id in (
+                '28975909992013618', '38154989454116081'):
+            username = (current.query_referer or '').rstrip('/').rsplit('/', 1)[-1]
+            expected_variables = _profile_posts_query_variables(username)
+            if primary.doc_id == '38154989454116081':
+                expected_variables.pop('first')
+                expected_variables.pop('include_multi_captions')
+                expected_variables['data'].pop('include_reel_media_seen_timestamp')
+                expected_variables['__relay_internal__pv__PolarisMultiCaptionCarouselEnabledrelayprovider'] = False
+            edges = primary.remaining_data['edges'] if primary.remaining_data is not None else []
+            public_edges = bool(edges) and all(
+                edge['node'].get('__typename', '').startswith('XIGPolaris') for edge in edges)
+            matching_scope = (primary.query_hash is None and primary.context_username is None
+                              and primary.query_referer == current.query_referer
+                              and primary.query_variables == expected_variables)
+            if not public_edges or not matching_scope:
+                raise InvalidArgumentException('Saved native timeline state cannot be applied to the public '
+                                               'ordered connection; its cursor format is different.')
+            extensions = dict(primary.extra_fields or {})
+            extensions.setdefault('migrated_from_query', {'doc_id': primary.doc_id,
+                                                         'query_variables': primary.query_variables})
+            primary = primary._replace(doc_id=current.doc_id, query_variables=current.query_variables,
+                                       extra_fields=extensions)
+            self._context.log('Migrating saved public timeline to its matching anonymous query; retaining its cursor.')
         self._primary.thaw(primary)
         self._total_index = frozen.total_index
         self._best_before = frozen.best_before
@@ -1346,7 +1406,7 @@ class Profile:
             user.update(fragment)
         if not user.get('pk') or not user.get('username'):
             return None
-        node = dict(user, id=user['pk'])  # HTML's scoped "id" is not the account ID.
+        node = dict(user, id=user['pk'], _web_profile_id=user.get('id'))
         cls._validate_identity(node, username, profile_id)
         timeline = node.pop('polaris_ordered_timeline_connection', None)
         if timeline is not None and not isinstance(timeline, dict):
@@ -1368,34 +1428,22 @@ class Profile:
                                                    .format(username))
 
     @classmethod
-    def _web_timeline_node(cls, context: InstaloaderContext,
-                           username: str) -> Optional[Tuple[Dict[str, Any], Dict[str, Any]]]:
-        """Resolve a public profile from the first page of the web timeline query."""
-        response = context.doc_id_graphql_query(
-            _PROFILE_POSTS_DOC_ID,
-            {
-                **_profile_posts_query_variables(username),
-                "after": None,
-                "before": None,
-                "first": NodeIterator.page_length(),
-                "last": None,
-            },
-            "https://www.instagram.com/{0}/".format(username.lower()),
-        )
-        timeline = ((response.get("data") or {})
-                    .get("xdt_api__v1__feed__user_timeline_graphql_connection"))
-        if not isinstance(timeline, dict):
+    def _public_profile_query_node(cls, context: InstaloaderContext,
+                                   username: str, profile_id: Optional[int] = None
+                                   ) -> Optional[Tuple[Dict[str, Any], Optional[Dict[str, Any]]]]:
+        """Resolve public identity through the profile query, independently of post owners."""
+        response = context.public_graphql_query(
+            '27981003384861049', {'username': username.lower()},
+            'https://www.instagram.com/{}/'.format(username.lower()),
+            'PolarisLoggedOutDesktopWWWProfileRootContentQuery')
+        data = response.get('data') if isinstance(response, dict) else None
+        user = data.get('xig_user_by_username') if isinstance(data, dict) else None
+        if not isinstance(user, dict) or not user.get('pk') or not user.get('id') or not user.get('username'):
             return None
-        edges = timeline.get("edges") or []
-        if not edges:
-            return None
-        user = (edges[0].get("node") or {}).get("user")
-        if not isinstance(user, dict) or not user.get("pk") or not user.get("username"):
-            return None
-        node = cls._normalize_profile_data(user)
-        cls._validate_identity(node, username)
-        node.setdefault("edge_owner_to_timeline_media", {"count": None})
-        return node, timeline
+        node = cls._normalize_profile_data(dict(user, id=user['pk'], _web_profile_id=user['id']))
+        cls._validate_identity(node, username, profile_id)
+        node.setdefault('edge_owner_to_timeline_media', {'count': None})
+        return node, None
 
     @classmethod
     def _resolve_node(cls, context: InstaloaderContext,
@@ -1422,7 +1470,7 @@ class Profile:
                             .format(profile_id), flush=True)
                 return cls._cached_id_node(username, profile_id), None, True
             if not context.is_logged_in:
-                timeline_node = cls._web_timeline_node(context, username)
+                timeline_node = cls._public_profile_query_node(context, username, profile_id)
                 if timeline_node is not None:
                     return timeline_node[0], timeline_node[1], False
                 raise BadResponseException(
@@ -1446,7 +1494,7 @@ class Profile:
                         .format(profile_id), flush=True)
             return cls._cached_id_node(username, profile_id), None, True
         if not context.is_logged_in:
-            timeline_node = cls._web_timeline_node(context, username)
+            timeline_node = cls._public_profile_query_node(context, username, profile_id)
             if timeline_node is not None:
                 return timeline_node[0], timeline_node[1], False
             raise BadResponseException(
@@ -1769,6 +1817,31 @@ class Profile:
 
         :rtype: Iterator[Post]"""
         self._obtain_metadata()
+        if not self._context.is_logged_in:
+            if not self._node.get('_web_profile_id'):
+                resolved = self._page_profile_node(self._context, self.username, self.userid)
+                if resolved is None:
+                    resolved = self._public_profile_query_node(self._context, self.username, self.userid)
+                if resolved is None:
+                    raise BadResponseException('Public profile did not provide its scoped pagination ID.')
+                node, first_page = resolved
+                self._validate_identity(node, self.username, self.userid)
+                self._node.update(node)
+                self._web_posts_first_page = first_page
+                self._is_id_only = False
+            scoped_id = self._node.get('_web_profile_id')
+            if not isinstance(scoped_id, str) or not scoped_id:
+                raise BadResponseException('Public profile did not provide its scoped pagination ID.')
+            public_iterator = _PublicProfilePostIterator(
+                context=self._context, query_hash=None, doc_id=_PUBLIC_PROFILE_POSTS_DOC_ID,
+                edge_extractor=lambda data: _public_timeline_data(data, scoped_id),
+                node_wrapper=lambda node: (Post.from_shortcode(self._context, node['code'])
+                                          if node.get('__typename', '').startswith('XIGPolaris')
+                                          and 'taken_at' not in node else Post.from_iphone_struct(self._context, node)),
+                query_variables={'id': scoped_id, 'first': NodeIterator.page_length()},
+                query_referer='https://www.instagram.com/{}/'.format(self.username),
+                first_data=self._web_posts_first_page, is_first=Profile._make_is_newest_checker())
+            return _AnonymousPostIterator(self._context, public_iterator, self.userid)
         primary = NodeIterator(
             context=self._context,
             edge_extractor=(
@@ -1782,10 +1855,7 @@ class Profile:
             is_first=Profile._make_is_newest_checker(),
             doc_id=_PROFILE_POSTS_DOC_ID,
             query_hash=None,
-            first_data=(self._web_posts_first_page if not self._context.is_logged_in else None),
         )
-        if not self._context.is_logged_in:
-            return _AnonymousPostIterator(self._context, primary, self.userid)
         return primary
 
     def get_saved_posts(self) -> NodeIterator[Post]:
