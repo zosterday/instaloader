@@ -46,6 +46,8 @@ class PublicServer:
         self.profile_csrf_cookie = None
         self.rotate_csrf = False
         self.next_page_override = None
+        self.total = 25
+        self.fail_post_once = None
 
     def send(self, session, request, **kwargs):
         self.requests.append(request)
@@ -58,11 +60,14 @@ class PublicServer:
             if self.profile_csrf_cookie:
                 session.cookies.set('csrftoken', self.profile_csrf_cookie, domain='.instagram.com')
             data = {'xig_user_by_username': {'pk': '1234', 'id': 'scoped-profile', 'username': 'example',
-                    'is_private': False, 'all_media_count': 25, 'profile_pic_url': 'https://example.com/pic.jpg',
+                    'is_private': False, 'all_media_count': self.total, 'profile_pic_url': 'https://example.com/pic.jpg',
                     'polaris_ordered_timeline_connection': timeline(1, 13, 'public-cursor-1')}}
             text = html(data, bootstrap=True)
         elif path.startswith('/p/post'):
             i = int(path.split('/')[2][4:])
+            if i == self.fail_post_once:
+                self.fail_post_once = None
+                raise requests.exceptions.ConnectionError('Synthetic dropped connection')
             media = {'pk': str(1000 + i), 'id': 'scoped-media-' + str(i), 'code': 'post' + str(i),
                      'media_type': 1, 'taken_at': 1791933082 - i, 'caption': {'text': 'public fixture'},
                      'user': {'pk': '9999', 'username': 'coauthor'}, 'like_count': 1, 'comment_count': 0,
@@ -88,10 +93,12 @@ class PublicServer:
             elif self.api_error:
                 text = 'for (;;);' + json.dumps(self.api_error)
             else:
-                pages = {'public-cursor-1': timeline(13, 25, 'public-cursor-2'),
-                         'public-cursor-2': timeline(25, 26, None)}
+                page = int(variables['after'].rsplit('-', 1)[1])
+                start = page * 12 + 1
+                end = min(start + 12, self.total + 1)
+                cursor = 'public-cursor-' + str(page + 1) if end <= self.total else None
                 text = 'for (;;);' + json.dumps({'data': {'node': {'id': self.reply_node_id,
-                        'polaris_ordered_timeline_connection': self.next_page_override or pages[variables['after']]}},
+                        'polaris_ordered_timeline_connection': self.next_page_override or timeline(start, end, cursor)}},
                         'extensions': {}})
                 if self.rotate_csrf:
                     session.cookies.set('csrftoken', 'synthetic-api-csrf', domain='.instagram.com')
@@ -122,6 +129,25 @@ class TestPublicPagination(unittest.TestCase):
         self.assertTrue(all(int(p.owner_id) == 9999 for p in posts))
         self.assertEqual([q[2]['after'] for q in self.server.api_requests],
                          ['public-cursor-1', 'public-cursor-2'])
+
+    def test_public_pagination_never_adds_multi_second_random_delays(self):
+        self.context.sleep = True
+        delays = []
+        with self.server.patch(), patch('instaloader.instaloadercontext.random.expovariate', return_value=12), \
+                patch('instaloader.instaloadercontext.time.sleep', side_effect=delays.append):
+            posts = list(Profile.from_username(self.context, 'example').get_posts())
+        self.assertEqual(len(posts), 25)
+        self.assertLessEqual(max(delays), 0.25)
+
+    def test_160_posts_survive_a_dropped_connection_at_post_81_without_losing_posts(self):
+        self.context.max_connection_attempts = 3
+        self.server.total = 160
+        self.server.fail_post_once = 81
+        with self.server.patch():
+            posts = list(Profile.from_username(self.context, 'example').get_posts())
+        self.assertEqual([p.mediaid for p in posts], list(range(1001, 1161)))
+        self.assertEqual(len(self.server.api_requests), 13)
+        self.assertEqual(sum(urlsplit(r.url).path == '/p/post81/' for r in self.server.requests), 2)
 
     def test_page_two_continues_after_freeze_load_thaw(self):
         with self.server.patch():

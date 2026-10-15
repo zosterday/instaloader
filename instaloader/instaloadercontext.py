@@ -514,7 +514,7 @@ class InstaloaderContext:
         is_other_query = not is_graphql_query and not is_doc_id_query and host == "www.instagram.com"
         sess = session if session else self._session
         try:
-            self.do_sleep()
+            self.do_sleep(maximum=0.25 if is_public_graphql else 15.0)
             if is_graphql_query:
                 self._rate_controller.wait_before_query(params['query_hash'])
             if is_doc_id_query:
@@ -840,21 +840,35 @@ class InstaloaderContext:
         Missing embedded data returns an empty list. Authentication and rate restrictions
         are terminal; callers must not interpret them as evidence that a profile is absent.
         """
-        self.do_sleep()
-        self._rate_controller.wait_before_query('other')
         url = 'https://www.instagram.com/{0}'.format(path)
         headers = {'Accept': 'text/html', 'Sec-Fetch-Dest': 'document', 'Sec-Fetch-Mode': 'navigate',
                    'Sec-Fetch-Site': 'none'}
-        try:
-            if self._public_session is None:
-                self._public_session = self.get_anonymous_session()
-                self._public_session.cookies.clear()
-            resp = self._public_session.get(url, headers=headers, allow_redirects=False)
-        except requests.exceptions.RequestException as err:
-            raise ConnectionException("Page request to {} failed ({})."
-                                      .format(_safe_url(url), type(err).__name__)) from err
-        if resp.status_code in self.fatal_status_codes:
-            raise self._http_error(AbortDownloadException, resp)
+        attempt = 0
+        while True:
+            attempt += 1
+            self.do_sleep(maximum=0.25)
+            self._rate_controller.wait_before_query('public_html')
+            try:
+                if self._public_session is None:
+                    self._public_session = self.get_anonymous_session()
+                    self._public_session.cookies.clear()
+                resp = self._public_session.get(url, headers=headers, allow_redirects=False)
+                if resp.status_code in self.fatal_status_codes:
+                    raise self._http_error(AbortDownloadException, resp)
+                if 500 <= resp.status_code < 600:
+                    raise self._http_error(ConnectionException, resp)
+                break
+            except (requests.exceptions.RequestException, ConnectionException) as err:
+                detail = type(err).__name__ if isinstance(err, requests.exceptions.RequestException) else str(err)
+                message = 'Page request to {} failed ({}).'.format(_safe_url(url), detail)
+                if self.max_connection_attempts and attempt >= self.max_connection_attempts:
+                    if isinstance(err, ConnectionException):
+                        err.args = (message,)
+                        raise
+                    raise ConnectionException(message) from err
+                delay = max(min(2 ** min(attempt - 1, 5), 30), getattr(err, 'retry_after', None) or 0)
+                self.error(message + ' [retrying in {:g}s; skip with ^C]'.format(delay), repeat_at_end=False)
+                self._rate_controller.sleep(delay)
         if resp.is_redirect:
             self._check_redirect(resp)
             raise self._http_error(BadResponseException, resp)
@@ -992,8 +1006,8 @@ class RateController:
             # timestamps of type query_type
             relevant_timestamps = self._query_timestamps[query_type]
         else:
-            # all GraphQL queries, i.e. not 'iphone' or 'other'
-            graphql_query_timestamps = filter(lambda tp: tp[0] not in ['iphone', 'other'],
+            # HTML navigations and legacy AJAX/mobile requests are not GraphQL.
+            graphql_query_timestamps = filter(lambda tp: tp[0] not in ['iphone', 'other', 'public_html'],
                                               self._query_timestamps.items())
             relevant_timestamps = [t for times in (tp[1] for tp in graphql_query_timestamps) for t in times]
         return list(filter(lambda t: t > current_time - window, relevant_timestamps))
@@ -1015,7 +1029,7 @@ class RateController:
                 return min(reqs_in_sliding_window) + per_type_sliding_window + 6
 
         def gql_accumulated_next_request_time():
-            if query_type in ['iphone', 'other']:
+            if query_type in ['iphone', 'other', 'public_html']:
                 return 0.0
             gql_accumulated_sliding_window = 600
             gql_accumulated_max_count = 275

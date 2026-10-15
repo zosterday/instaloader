@@ -178,6 +178,59 @@ class TestPublicPageHTTPContext(unittest.TestCase):
         with transport.patch():
             self.assertEqual(self.context.get_page_data("public_fixture/"), [])
 
+    def test_dropped_page_connection_and_server_error_recover_without_restart(self):
+        transport = Transport(requests.exceptions.ConnectionError('https://example.com/?token=fixture-secret'),
+                              response(503, headers={'Retry-After': '4'}),
+                              response(body='<script type="application/json">'
+                                            '{"__bbox":{"result":{"data":{"post":"recovered"}}}}'
+                                            '</script>'))
+        with transport.patch():
+            self.assertEqual(self.context.get_page_data('p/public_fixture/'), [{'post': 'recovered'}])
+        self.assertEqual(len(transport.requests), 3)
+        self.assertEqual([r.url for r in transport.requests],
+                         ['https://www.instagram.com/p/public_fixture/'] * 3)
+        self.assertEqual([c.args[0] for c in self.context._rate_controller.sleep.call_args_list], [1, 4])
+        self.assertNotIn('fixture-secret', str(self.context.error.call_args_list))
+
+    def test_page_transient_failure_stops_at_configured_attempt_limit(self):
+        for failure in (requests.exceptions.Timeout('fixture-secret'), response(503)):
+            with self.subTest(failure=type(failure).__name__):
+                transport = Transport(failure, failure, failure)
+                with transport.patch(), self.assertRaises(ConnectionException) as caught:
+                    self.context.get_page_data('p/public_fixture/')
+                self.assertEqual(len(transport.requests), 3)
+                self.assertNotIn('fixture-secret', str(caught.exception))
+                if isinstance(failure, requests.Response):
+                    self.assertEqual(caught.exception.status_code, 503)
+
+    def test_public_page_pacing_adds_at_most_quarter_second_per_request(self):
+        self.context.sleep = True
+        transport = Transport(response(body='<html></html>'))
+        delays = []
+        with transport.patch(), patch('instaloader.instaloadercontext.random.expovariate', return_value=12), \
+                patch('instaloader.instaloadercontext.time.sleep', side_effect=delays.append):
+            self.context.get_page_data('public_fixture/')
+        self.assertLessEqual(sum(delays), 0.25)
+
+    def test_160_public_pages_do_not_inherit_the_75_request_json_budget(self):
+        context = InstaloaderContext(sleep=False, quiet=True)
+        self.addCleanup(context.close)
+        transport = Transport(*(response(body='<html></html>') for _ in range(160)))
+        clock = [1000.0]
+        delays = []
+        def sleep(seconds):
+            delays.append(seconds)
+            clock[0] += seconds
+        with transport.patch(), patch('instaloader.instaloadercontext.time.monotonic', side_effect=lambda: clock[0]), \
+                patch('instaloader.instaloadercontext.time.sleep', side_effect=sleep):
+            for _ in range(160):
+                self.assertEqual(context.get_page_data('public_fixture/'), [])
+            # HTML navigations must not consume the separate aggregate GraphQL budget.
+            for _ in range(120):
+                context._rate_controller.wait_before_query('fixture_graphql')
+        self.assertEqual(len(transport.requests), 160)
+        self.assertEqual(delays, [])
+
     def test_page_request_uses_anonymous_session_and_existing_user_agent(self):
         self.context._session.cookies.set("sessionid", "fixture-owned-session")
         self.context._session.headers["Authorization"] = "Bearer fixture-owned-token"
